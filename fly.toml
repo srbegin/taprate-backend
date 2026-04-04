@@ -1,0 +1,44 @@
+app = "cleanpulse-api"
+primary_region = "ewr"  # Newark — closest to Narragansett RI
+
+[build]
+
+[env]
+  PORT = "8000"
+  DJANGO_SETTINGS_MODULE = "core.settings"
+
+[deploy]
+  release_command = "python manage.py migrate --noinput"
+
+[processes]
+  app = "gunicorn core.wsgi:application --bind 0.0.0.0:8000 --workers 1 --timeout 60"
+  worker = "celery -A core worker --loglevel=info"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8000
+  processes = ["app"]
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "5s"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
