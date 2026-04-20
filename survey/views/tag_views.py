@@ -17,7 +17,7 @@ class NfcTagView(APIView):
 
     def get(self, request, tag_id):
         """Public — check if tag is claimed."""
-        tag, _ = NfcTag.objects.get_or_create(id=tag_id)
+        tag = get_object_or_404(NfcTag, id=tag_id)
         if tag.location:
             return Response({
                 'claimed': True,
@@ -38,7 +38,7 @@ class NfcTagView(APIView):
             Location, id=location_id, organization=request.user.organization
         )
 
-        tag, _ = NfcTag.objects.get_or_create(id=tag_id)
+        tag = get_object_or_404(NfcTag, id=tag_id)
 
         # Block if already owned by a different org
         if tag.organization and tag.organization != request.user.organization:

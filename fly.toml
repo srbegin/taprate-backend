@@ -11,7 +11,7 @@ primary_region = "ewr"  # Newark — closest to Narragansett RI
   release_command = "python manage.py migrate --noinput"
 
 [processes]
-  app = "gunicorn core.wsgi:application --bind 0.0.0.0:8000 --workers 1 --timeout 60"
+  app = "gunicorn core.wsgi:application --bind 0.0.0.0:8000 --workers 1 --timeout 60 --access-logfile -"
   worker = "celery -A core worker --loglevel=info"
 
 [[services]]

@@ -1,3 +1,7 @@
+import io
+import qrcode
+from django.http import HttpResponse
+
 from datetime import timedelta
 
 from django.db.models import Avg, Count, FloatField
@@ -9,16 +13,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import Location, Survey, Incentive, SurveyResponse, Alert
+from ..models import Location, Survey, SurveySet, Incentive, SurveyResponse, Alert
 from ..serializers import (
     LocationSerializer,
-    SurveySerializer,
-    SurveyWriteSerializer,
+    SurveySerializer, SurveyWriteSerializer,
+    SurveySetSerializer, SurveySetWriteSerializer,
     IncentiveSerializer,
 )
 
 
-# ── Locations ────────────────────────────────────────────────────────────────
+# ── Locations ─────────────────────────────────────────────────────────────────
 
 class LocationListView(APIView):
     permission_classes = [IsAuthenticated]
@@ -26,16 +30,12 @@ class LocationListView(APIView):
     def get(self, request):
         locations = Location.objects.filter(
             organization=request.user.organization
-        ).select_related('survey').order_by('-created_at')
-        serializer = LocationSerializer(
-            locations, many=True, context={'request': request}
-        )
+        ).select_related('survey_set').order_by('-created_at')
+        serializer = LocationSerializer(locations, many=True, context={'request': request})
         return Response(serializer.data)
 
     def post(self, request):
-        serializer = LocationSerializer(
-            data=request.data, context={'request': request}
-        )
+        serializer = LocationSerializer(data=request.data, context={'request': request})
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         serializer.save(organization=request.user.organization)
@@ -46,15 +46,12 @@ class LocationDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def _get_location(self, request, pk):
-        return get_object_or_404(
-            Location, id=pk, organization=request.user.organization
-        )
+        return get_object_or_404(Location, id=pk, organization=request.user.organization)
 
     def patch(self, request, pk):
         location = self._get_location(request, pk)
         serializer = LocationSerializer(
-            location, data=request.data,
-            partial=True, context={'request': request}
+            location, data=request.data, partial=True, context={'request': request}
         )
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -62,69 +59,126 @@ class LocationDetailView(APIView):
         return Response(serializer.data)
 
     def delete(self, request, pk):
-        location = self._get_location(request, pk)
-        location.delete()
+        self._get_location(request, pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Surveys ──────────────────────────────────────────────────────────────────
+# ── Survey Sets ───────────────────────────────────────────────────────────────
 
-class SurveyListView(APIView):
+class SurveySetListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        surveys = Survey.objects.filter(
+        sets = SurveySet.objects.filter(
             organization=request.user.organization
-        ).prefetch_related('locations').order_by('-created_at')
-        serializer = SurveySerializer(surveys, many=True)
-        return Response(serializer.data)
+        ).prefetch_related('surveys__incentive', 'locations').order_by('-created_at')
+        return Response(SurveySetSerializer(sets, many=True).data)
 
     def post(self, request):
-        serializer = SurveyWriteSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        survey = serializer.save(organization=request.user.organization)
-        return Response(SurveySerializer(survey).data, status=status.HTTP_201_CREATED)
+        questions_data = request.data.pop('questions', [])
 
+        set_serializer = SurveySetWriteSerializer(data=request.data)
+        if not set_serializer.is_valid():
+            return Response(set_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class SurveyDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+        survey_set = set_serializer.save(organization=request.user.organization)
 
-    def _get_survey(self, request, pk):
-        return get_object_or_404(
-            Survey, id=pk, organization=request.user.organization
+        for i, q_data in enumerate(questions_data):
+            q_data.setdefault('position', i)
+            q_ser = SurveyWriteSerializer(data=q_data)
+            if q_ser.is_valid():
+                q_ser.save(
+                    survey_set=survey_set,
+                    organization=request.user.organization,
+                )
+
+        survey_set.refresh_from_db()
+        return Response(
+            SurveySetSerializer(survey_set).data,
+            status=status.HTTP_201_CREATED
         )
 
+
+class SurveySetDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_set(self, request, pk):
+        return get_object_or_404(SurveySet, id=pk, organization=request.user.organization)
+
     def get(self, request, pk):
-        survey = self._get_survey(request, pk)
-        return Response(SurveySerializer(survey).data)
+        return Response(SurveySetSerializer(self._get_set(request, pk)).data)
 
     def patch(self, request, pk):
-        survey = self._get_survey(request, pk)
-        serializer = SurveyWriteSerializer(survey, data=request.data, partial=True)
+        survey_set = self._get_set(request, pk)
+        serializer = SurveySetWriteSerializer(survey_set, data=request.data, partial=True)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        survey = serializer.save()
-        return Response(SurveySerializer(survey).data)
+        survey_set = serializer.save()
+        return Response(SurveySetSerializer(survey_set).data)
 
     def delete(self, request, pk):
-        survey = self._get_survey(request, pk)
-        survey.delete()
+        self._get_set(request, pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Incentive ─────────────────────────────────────────────────────────────────
+# ── Questions (nested under SurveySet) ───────────────────────────────────────
+
+class QuestionListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_set(self, request, set_pk):
+        return get_object_or_404(SurveySet, id=set_pk, organization=request.user.organization)
+
+    def post(self, request, set_pk):
+        survey_set = self._get_set(request, set_pk)
+        serializer = SurveyWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        question = serializer.save(
+            survey_set=survey_set,
+            organization=request.user.organization,
+        )
+        return Response(SurveySerializer(question).data, status=status.HTTP_201_CREATED)
+
+
+class QuestionDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_question(self, request, set_pk, pk):
+        return get_object_or_404(
+            Survey,
+            id=pk,
+            survey_set_id=set_pk,
+            organization=request.user.organization,
+        )
+
+    def patch(self, request, set_pk, pk):
+        question = self._get_question(request, set_pk, pk)
+        serializer = SurveyWriteSerializer(question, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response(SurveySerializer(serializer.save()).data)
+
+    def delete(self, request, set_pk, pk):
+        self._get_question(request, set_pk, pk).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── Incentive (nested under individual question) ──────────────────────────────
 
 class IncentiveView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def _get_survey(self, request, survey_pk):
+    def _get_question(self, request, set_pk, survey_pk):
         return get_object_or_404(
-            Survey, id=survey_pk, organization=request.user.organization
+            Survey,
+            id=survey_pk,
+            survey_set_id=set_pk,
+            organization=request.user.organization,
         )
 
-    def post(self, request, survey_pk):
-        survey = self._get_survey(request, survey_pk)
+    def post(self, request, set_pk, survey_pk):
+        survey = self._get_question(request, set_pk, survey_pk)
         if hasattr(survey, 'incentive'):
             return Response(
                 {'detail': 'Incentive already exists. Use PATCH to update.'},
@@ -136,8 +190,8 @@ class IncentiveView(APIView):
         serializer.save(survey=survey)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    def patch(self, request, survey_pk):
-        survey = self._get_survey(request, survey_pk)
+    def patch(self, request, set_pk, survey_pk):
+        survey = self._get_question(request, set_pk, survey_pk)
         incentive = get_object_or_404(Incentive, survey=survey)
         serializer = IncentiveSerializer(incentive, data=request.data, partial=True)
         if not serializer.is_valid():
@@ -145,21 +199,15 @@ class IncentiveView(APIView):
         serializer.save()
         return Response(serializer.data)
 
-    def delete(self, request, survey_pk):
-        survey = self._get_survey(request, survey_pk)
-        incentive = get_object_or_404(Incentive, survey=survey)
-        incentive.delete()
+    def delete(self, request, set_pk, survey_pk):
+        survey = self._get_question(request, set_pk, survey_pk)
+        get_object_or_404(Incentive, survey=survey).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ── Alerts ────────────────────────────────────────────────────────────────────
 
 class AlertListView(APIView):
-    """
-    GET /api/dashboard/alerts/
-    Returns all pending alerts for the org, newest first.
-    Optional ?status=pending|sent|resolved filter.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -167,13 +215,9 @@ class AlertListView(APIView):
         qs = Alert.objects.filter(
             location__organization=request.user.organization,
         ).select_related('location', 'survey_response').order_by('-created_at')
-
         if status_filter != 'all':
             qs = qs.filter(status=status_filter)
-
-        return Response([
-            self._serialize(a) for a in qs[:50]
-        ])
+        return Response([self._serialize(a) for a in qs[:50]])
 
     @staticmethod
     def _serialize(alert):
@@ -190,29 +234,20 @@ class AlertListView(APIView):
 
 
 class AlertDetailView(APIView):
-    """
-    PATCH /api/dashboard/alerts/<pk>/
-    Accepts { "status": "resolved" } to resolve an alert.
-    """
     permission_classes = [IsAuthenticated]
 
     def patch(self, request, pk):
         alert = get_object_or_404(
-            Alert,
-            id=pk,
-            location__organization=request.user.organization,
+            Alert, id=pk, location__organization=request.user.organization
         )
         new_status = request.data.get('status')
-        if new_status not in ('pending', 'resolved'):
+        if new_status not in ('pending', 'owner_notified', 'resolved'):
             return Response(
-                {'detail': 'status must be "pending" or "resolved".'},
+                {'detail': 'status must be "pending", "owner_notified", or "resolved".'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         alert.status = new_status
-        if new_status == 'resolved':
-            alert.resolved_at = timezone.now()
-        else:
-            alert.resolved_at = None
+        alert.resolved_at = timezone.now() if new_status == 'resolved' else None
         alert.save(update_fields=['status', 'resolved_at'])
         return Response(AlertListView._serialize(alert))
 
@@ -220,21 +255,16 @@ class AlertDetailView(APIView):
 # ── Insights ──────────────────────────────────────────────────────────────────
 
 class InsightsView(APIView):
-    """
-    GET /api/dashboard/insights/?days=30&location=<uuid>
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         org = request.user.organization
-
         try:
             days = min(int(request.query_params.get('days', 30)), 90)
         except (ValueError, TypeError):
             days = 30
 
         location_id = request.query_params.get('location')
-
         now = timezone.now()
         period_start = now - timedelta(days=days)
         prev_start = period_start - timedelta(days=days)
@@ -246,19 +276,11 @@ class InsightsView(APIView):
         current_qs = base_qs.filter(created_at__gte=period_start)
         previous_qs = base_qs.filter(created_at__gte=prev_start, created_at__lt=period_start)
 
-        current_agg = current_qs.aggregate(
-            avg=Avg('rating', output_field=FloatField()),
-            count=Count('id'),
-        )
-        previous_agg = previous_qs.aggregate(
-            avg=Avg('rating', output_field=FloatField()),
-            count=Count('id'),
-        )
+        current_agg = current_qs.aggregate(avg=Avg('rating', output_field=FloatField()), count=Count('id'))
+        previous_agg = previous_qs.aggregate(avg=Avg('rating', output_field=FloatField()), count=Count('id'))
 
         current_avg = round(current_agg['avg'] or 0, 2)
         previous_avg = round(previous_agg['avg'] or 0, 2)
-        avg_delta = round(current_avg - previous_avg, 2) if previous_avg else None
-        count_delta = current_agg['count'] - previous_agg['count']
 
         daily = (
             current_qs
@@ -294,8 +316,7 @@ class InsightsView(APIView):
             distribution[str(row['rating'])] = row['count']
 
         alert_qs = Alert.objects.filter(
-            location__organization=org,
-            status='pending',
+            location__organization=org, status__in=['pending', 'owner_notified']
         ).select_related('location').order_by('-created_at')
         if location_id:
             alert_qs = alert_qs.filter(location_id=location_id)
@@ -304,28 +325,106 @@ class InsightsView(APIView):
             'days': days,
             'summary': {
                 'avg_rating': current_avg,
-                'avg_delta': avg_delta,
+                'avg_delta': round(current_avg - previous_avg, 2) if previous_avg else None,
                 'total_responses': current_agg['count'],
-                'count_delta': count_delta,
+                'count_delta': current_agg['count'] - previous_agg['count'],
             },
             'daily_series': daily_series,
             'by_location': [
-                {
-                    'id': str(row['location__id']),
-                    'name': row['location__name'],
-                    'avg': round(row['avg'], 2),
-                    'count': row['count'],
-                }
-                for row in location_breakdown
+                {'id': str(r['location__id']), 'name': r['location__name'],
+                 'avg': round(r['avg'], 2), 'count': r['count']}
+                for r in location_breakdown
             ],
             'distribution': distribution,
             'pending_alerts': [
-                {
-                    'id': str(a.id),
-                    'location': a.location.name,
-                    'rating': a.rating,
-                    'created_at': a.created_at.isoformat(),
-                }
+                {'id': str(a.id), 'location': a.location.name,
+                 'rating': a.rating, 'status': a.status, 'created_at': a.created_at.isoformat()}
                 for a in alert_qs[:10]
             ],
         })
+
+
+# ── Comment Feed ──────────────────────────────────────────────────────────────
+
+class CommentFeedView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        org = request.user.organization
+
+        qs = (
+            SurveyResponse.objects
+            .filter(location__organization=org)
+            .exclude(comment='')
+            .select_related('location', 'survey_set')
+            .order_by('-created_at')
+        )
+
+        location_id = request.query_params.get('location')
+        if location_id:
+            qs = qs.filter(location_id=location_id)
+
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+
+        try:
+            page = max(int(request.query_params.get('page', 1)), 1)
+            page_size = min(int(request.query_params.get('page_size', 20)), 100)
+        except (ValueError, TypeError):
+            page, page_size = 1, 20
+
+        total = qs.count()
+        offset = (page - 1) * page_size
+        items = qs[offset:offset + page_size]
+
+        return Response({
+            'total': total,
+            'page': page,
+            'page_size': page_size,
+            'results': [
+                {
+                    'id': str(r.id),
+                    'comment': r.comment,
+                    'rating': r.rating,
+                    'created_at': r.created_at.isoformat(),
+                    'location_id': str(r.location.id),
+                    'location_name': r.location.name,
+                    'survey_set_name': r.survey_set.name if r.survey_set else None,
+                }
+                for r in items
+            ],
+        })
+
+class QRCodeView(APIView):
+    permission_classes = [IsAuthenticated]
+ 
+    def get(self, request, pk):
+        location = get_object_or_404(Location, id=pk, organization=request.user.organization)
+ 
+        if not location.qr_enabled:
+            return Response(
+                {'detail': 'QR code is not enabled for this location.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+ 
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(location.nfc_url)
+        qr.make(fit=True)
+ 
+        img = qr.make_image(fill_color='black', back_color='white')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
+ 
+        response = HttpResponse(buf, content_type='image/png')
+        response['Content-Disposition'] = f'inline; filename="qr-{location.id}.png"'
+        return response

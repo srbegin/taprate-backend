@@ -23,5 +23,14 @@ whitenoise
 requests
 
 # Email (Step 6)
+resend
 sendgrid
 django-sendgrid-v5
+
+# QR Codes
+qrcode[pil]
+
+python-dotenv
+
+# Billing
+stripe

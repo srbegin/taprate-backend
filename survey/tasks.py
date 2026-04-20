@@ -2,7 +2,7 @@
 Celery tasks for TapRate.
 
 Required environment variables:
-    SENDGRID_API_KEY   — SendGrid API key
+    RESEND_API_KEY     — Resend API key
     ALERTS_FROM_EMAIL  — verified sender address (default: alerts@taprate.app)
     FRONTEND_URL       — used to build dashboard deep-link in emails
 """
@@ -16,37 +16,35 @@ logger = logging.getLogger(__name__)
 
 def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> bool:
     """
-    Send a transactional email via SendGrid.
+    Send a transactional email via Resend.
     Returns True on success, False on failure.
-    Isolated here so it's easy to swap providers later.
     """
-    import sendgrid
-    from sendgrid.helpers.mail import Mail, To, From, Content
+    import resend
 
-    api_key = os.environ.get('SENDGRID_API_KEY')
+    api_key = os.environ.get('RESEND_API_KEY')
     if not api_key:
-        logger.error('SENDGRID_API_KEY not set — skipping email send')
+        logger.error('RESEND_API_KEY not set — skipping email send')
         return False
 
+    resend.api_key = api_key
     from_email = os.environ.get('ALERTS_FROM_EMAIL', 'alerts@taprate.app')
 
-    message = Mail(
-        from_email=From(from_email, 'TapRate'),
-        to_emails=To(to),
-        subject=subject,
-    )
-    message.add_content(Content('text/plain', text_body))
-    message.add_content(Content('text/html', html_body))
-
     try:
-        sg = sendgrid.SendGridAPIClient(api_key=api_key)
-        response = sg.send(message)
-        if response.status_code >= 400:
-            logger.error(f'SendGrid error {response.status_code}: {response.body}')
+        response = resend.Emails.send({
+            'from': f'TapRate <{from_email}>',
+            'to': [to],
+            'subject': subject,
+            'html': html_body,
+            'text': text_body,
+        })
+        # Resend raises on error; if we get here it succeeded.
+        # response is a dict with an 'id' key on success.
+        if not response.get('id'):
+            logger.error(f'Resend returned unexpected response: {response}')
             return False
         return True
     except Exception as e:
-        logger.error(f'SendGrid exception: {e}')
+        logger.error(f'Resend exception: {e}')
         return False
 
 
@@ -55,9 +53,10 @@ def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> boo
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def send_alert(self, alert_id):
     """
-    Triggered when a SurveyResponse rating falls at or below the survey's
+    Triggered when a SurveyResponse rating falls at or below the survey set's
     alert_threshold. Sends an email to the organization's alert_email address,
     falling back to the owner account email if none is set.
+    Sets alert.status = 'owner_notified' on successful send.
     """
     from .models import Alert, User
 
@@ -142,11 +141,10 @@ def send_alert(self, alert_id):
     )
 
     if success:
-        alert.status = 'sent'
+        alert.status = 'owner_notified'
         alert.save(update_fields=['status'])
         logger.info(f'Alert email sent for alert {alert_id} to {recipient}')
     else:
-        # Retry with exponential backoff
         try:
             raise self.retry()
         except self.MaxRetriesExceededError:

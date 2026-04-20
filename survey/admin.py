@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Organization, User, Survey, Incentive, Location, SurveyResponse, Alert
+from .models import Organization, User, Survey, Incentive, Location, SurveyResponse, Alert, NfcTag
 
 admin.site.register(Organization)
 admin.site.register(User)
@@ -8,6 +8,7 @@ admin.site.register(Incentive)
 admin.site.register(Location)
 admin.site.register(SurveyResponse)
 admin.site.register(Alert)
+admin.site.register(NfcTag)
 
 # from django.contrib import admin
 # from django.db.models import Avg, Count
