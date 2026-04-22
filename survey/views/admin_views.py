@@ -2,6 +2,7 @@ from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.db.models import Count
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
@@ -114,3 +115,16 @@ class AdminRecentSignupsView(APIView):
                 for u in recent_users
             ],
         })
+
+
+class AdminTagDetailView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, tag_id):
+        """Release a claimed tag back to unclaimed state."""
+        tag = get_object_or_404(NfcTag, id=tag_id)
+        tag.organization = None
+        tag.location = None
+        tag.claimed_at = None
+        tag.save()
+        return Response({'id': str(tag.id), 'claimed': False})

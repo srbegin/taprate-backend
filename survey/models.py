@@ -68,7 +68,6 @@ class User(AbstractUser):
 class SurveySet(models.Model):
     """
     A named collection of ordered survey questions assigned to a Location.
-    Replaces the single Survey → Location relationship.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
@@ -84,6 +83,10 @@ class SurveySet(models.Model):
         default=2,
         help_text='Create an alert when any rating is at or below this value (1–5).',
     )
+    # ── Review redirect ───────────────────────────────────────────────────────
+    review_redirect_url     = models.URLField(blank=True)
+    review_redirect_enabled = models.BooleanField(default=False)
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -125,17 +128,32 @@ class Survey(models.Model):
 
 
 class Incentive(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    survey = models.OneToOneField(Survey, on_delete=models.CASCADE, related_name='incentive')
-    active = models.BooleanField(default=True)
-    win_rate = models.IntegerField(default=10, help_text='1 in X chance of winning')
-    prize_text = models.CharField(max_length=200)
+    """
+    Org-scoped incentive that can be assigned to a SurveySet.
+    Win rate is expressed as a percentage (1–100).
+    """
+    id           = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization, on_delete=models.CASCADE, related_name='incentives'
+    )
+    survey_set   = models.ForeignKey(
+        SurveySet, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='incentives'
+    )
+    name         = models.CharField(max_length=200)
+    active       = models.BooleanField(default=True)
+    win_rate     = models.IntegerField(
+        default=10,
+        help_text='Percentage chance of winning (1–100)',
+    )
+    prize_text    = models.CharField(max_length=200)
     email_subject = models.CharField(max_length=200, default='You won a prize!')
-    email_body = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    email_body    = models.TextField(blank=True)
+    created_at    = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.survey.question[:40]} — {self.prize_text}"
+        assigned = self.survey_set.name if self.survey_set else 'unassigned'
+        return f"{self.name} — {self.prize_text} [{assigned}]"
 
 
 class Location(models.Model):
@@ -217,6 +235,7 @@ class SurveyResponse(models.Model):
     rating = models.IntegerField(choices=RATING_CHOICES)
     comment = models.TextField(blank=True)
     email = models.EmailField(blank=True)
+    marketing_opt_in = models.BooleanField(default=False)
     incentive_won = models.BooleanField(default=False)
     incentive_claimed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -254,3 +273,28 @@ class Alert(models.Model):
 
     def __str__(self):
         return f"Alert: {self.location} — {self.rating}★ [{self.status}]"
+
+
+class IncentiveWin(models.Model):
+    """
+    Created when a respondent wins an incentive draw.
+    The unique code is shown to the customer; staff enter it at /dashboard/redeem.
+    """
+    id              = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    incentive       = models.ForeignKey(Incentive, on_delete=models.CASCADE, related_name='wins')
+    survey_response = models.ForeignKey(
+        SurveyResponse, on_delete=models.CASCADE, related_name='wins'
+    )
+    code            = models.CharField(max_length=8, unique=True, db_index=True)
+    email           = models.EmailField(blank=True)
+    marketing_opt_in = models.BooleanField(default=False)
+    redeemed_at     = models.DateTimeField(null=True, blank=True)
+    redeemed_by     = models.ForeignKey(
+        'User', null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='redemptions'
+    )
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        state = 'redeemed' if self.redeemed_at else 'pending'
+        return f"Win {self.code} [{state}] — {self.incentive.prize_text}"

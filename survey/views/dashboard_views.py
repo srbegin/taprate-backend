@@ -13,12 +13,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import Location, Survey, SurveySet, Incentive, SurveyResponse, Alert
+from ..models import Location, Survey, SurveySet, SurveyResponse, Alert
 from ..serializers import (
     LocationSerializer,
     SurveySerializer, SurveyWriteSerializer,
     SurveySetSerializer, SurveySetWriteSerializer,
-    IncentiveSerializer,
 )
 
 
@@ -71,7 +70,7 @@ class SurveySetListView(APIView):
     def get(self, request):
         sets = SurveySet.objects.filter(
             organization=request.user.organization
-        ).prefetch_related('surveys__incentive', 'locations').order_by('-created_at')
+        ).prefetch_related('surveys', 'incentives', 'locations').order_by('-created_at')
         return Response(SurveySetSerializer(sets, many=True).data)
 
     def post(self, request):
@@ -163,46 +162,6 @@ class QuestionDetailView(APIView):
         self._get_question(request, set_pk, pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-
-# ── Incentive (nested under individual question) ──────────────────────────────
-
-class IncentiveView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def _get_question(self, request, set_pk, survey_pk):
-        return get_object_or_404(
-            Survey,
-            id=survey_pk,
-            survey_set_id=set_pk,
-            organization=request.user.organization,
-        )
-
-    def post(self, request, set_pk, survey_pk):
-        survey = self._get_question(request, set_pk, survey_pk)
-        if hasattr(survey, 'incentive'):
-            return Response(
-                {'detail': 'Incentive already exists. Use PATCH to update.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        serializer = IncentiveSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save(survey=survey)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    def patch(self, request, set_pk, survey_pk):
-        survey = self._get_question(request, set_pk, survey_pk)
-        incentive = get_object_or_404(Incentive, survey=survey)
-        serializer = IncentiveSerializer(incentive, data=request.data, partial=True)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save()
-        return Response(serializer.data)
-
-    def delete(self, request, set_pk, survey_pk):
-        survey = self._get_question(request, set_pk, survey_pk)
-        get_object_or_404(Incentive, survey=survey).delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ── Alerts ────────────────────────────────────────────────────────────────────
@@ -398,6 +357,31 @@ class CommentFeedView(APIView):
                 for r in items
             ],
         })
+
+
+class OrganizationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from ..serializers import OrganizationSerializer
+        return Response(OrganizationSerializer(request.user.organization).data)
+
+    def patch(self, request):
+        org = request.user.organization
+        if not org:
+            return Response({'detail': 'No organization found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Only these fields are user-editable
+        allowed = {k: v for k, v in request.data.items() if k in ('name', 'brand_color', 'logo_url')}
+
+        from ..serializers import OrganizationSerializer
+        serializer = OrganizationSerializer(org, data=allowed, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        return Response(serializer.data)
+
+        
 
 class QRCodeView(APIView):
     permission_classes = [IsAuthenticated]

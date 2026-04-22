@@ -64,6 +64,36 @@ class LoginView(APIView):
             'tokens': _token_pair(user),
         })
 
+class ChangePasswordView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        current = request.data.get('current_password', '')
+        new_pw  = request.data.get('new_password', '')
+
+        if not current or not new_pw:
+            return Response(
+                {'detail': 'current_password and new_password are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(new_pw) < 8:
+            return Response(
+                {'detail': 'New password must be at least 8 characters.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = authenticate(request, username=request.user.username, password=current)
+        if not user:
+            return Response(
+                {'detail': 'Current password is incorrect.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.set_password(new_pw)
+        user.save()
+        return Response({'detail': 'Password updated successfully.'})
+
+        
 
 class TokenRefreshView(APIView):
     """Thin wrapper so the frontend hits a consistent /api/auth/ prefix."""
