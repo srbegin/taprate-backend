@@ -4,7 +4,7 @@ from django.utils.text import slugify
 from django.utils import timezone
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from .models import Organization, Incentive, IncentiveWin, Survey, SurveySet, SurveyResponse, Location
+from .models import Organization, Incentive, IncentiveWin, Survey, Question, SurveyResponse, Location
 
 User = get_user_model()
 
@@ -13,29 +13,29 @@ User = get_user_model()
 
 class IncentiveSerializer(serializers.ModelSerializer):
     """Full CRUD serializer for /dashboard/incentives."""
-    survey_set_name = serializers.CharField(source='survey_set.name', read_only=True)
+    survey_name = serializers.CharField(source='survey.name', read_only=True)
 
     class Meta:
         model = Incentive
         fields = [
             'id', 'name', 'active', 'win_rate', 'prize_text',
             'email_subject', 'email_body',
-            'survey_set', 'survey_set_name',
+            'survey', 'survey_name',
             'created_at',
         ]
-        read_only_fields = ['id', 'created_at', 'survey_set_name']
+        read_only_fields = ['id', 'created_at', 'survey_name']
 
     def validate_win_rate(self, value):
         if not (1 <= value <= 100):
             raise serializers.ValidationError('Win rate must be between 1 and 100.')
         return value
 
-    def validate_survey_set(self, value):
+    def validate_survey(self, value):
         if value is None:
             return value
         request = self.context.get('request')
         if value.organization != request.user.organization:
-            raise serializers.ValidationError('Survey set not found.')
+            raise serializers.ValidationError('Survey not found.')
         return value
 
 
@@ -47,9 +47,9 @@ class IncentivePublicSerializer(serializers.ModelSerializer):
 
 
 class IncentiveWinSerializer(serializers.ModelSerializer):
-    incentive_name  = serializers.CharField(source='incentive.name', read_only=True)
-    prize_text      = serializers.CharField(source='incentive.prize_text', read_only=True)
-    location_name   = serializers.CharField(
+    incentive_name = serializers.CharField(source='incentive.name', read_only=True)
+    prize_text     = serializers.CharField(source='incentive.prize_text', read_only=True)
+    location_name  = serializers.CharField(
         source='survey_response.location.name', read_only=True
     )
 
@@ -71,19 +71,19 @@ class RedeemSerializer(serializers.Serializer):
         return value.upper().strip()
 
 
-# ── Survey (individual question) ──────────────────────────────────────────────
+# ── Question (individual question within a Survey) ────────────────────────────
 
-class SurveySerializer(serializers.ModelSerializer):
+class QuestionSerializer(serializers.ModelSerializer):
     """Dashboard read serializer for a single question."""
     class Meta:
-        model = Survey
+        model = Question
         fields = ['id', 'question', 'scale_type', 'position', 'created_at']
         read_only_fields = ['id', 'created_at']
 
 
-class SurveyWriteSerializer(serializers.ModelSerializer):
+class QuestionWriteSerializer(serializers.ModelSerializer):
     class Meta:
-        model = Survey
+        model = Question
         fields = ['question', 'scale_type', 'position']
 
     def validate_position(self, value):
@@ -92,21 +92,21 @@ class SurveyWriteSerializer(serializers.ModelSerializer):
         return value
 
 
-# ── SurveySet ─────────────────────────────────────────────────────────────────
+# ── Survey (collection of questions) ─────────────────────────────────────────
 
-class SurveySetSerializer(serializers.ModelSerializer):
+class SurveySerializer(serializers.ModelSerializer):
     """Dashboard read serializer — includes nested questions, location count, active incentive."""
-    surveys        = SurveySerializer(many=True, read_only=True)
+    questions      = QuestionSerializer(many=True, read_only=True)
     location_count = serializers.IntegerField(source='locations.count', read_only=True)
     active_incentive = serializers.SerializerMethodField()
 
     class Meta:
-        model = SurveySet
+        model = Survey
         fields = [
             'id', 'name', 'comments_enabled', 'comments_prompt',
             'alert_threshold',
             'review_redirect_url', 'review_redirect_enabled',
-            'surveys', 'location_count', 'active_incentive',
+            'questions', 'location_count', 'active_incentive',
             'created_at',
         ]
         read_only_fields = ['id', 'created_at']
@@ -118,9 +118,9 @@ class SurveySetSerializer(serializers.ModelSerializer):
         return {'id': str(inc.id), 'name': inc.name, 'prize_text': inc.prize_text}
 
 
-class SurveySetWriteSerializer(serializers.ModelSerializer):
+class SurveyWriteSerializer(serializers.ModelSerializer):
     class Meta:
-        model = SurveySet
+        model = Survey
         fields = [
             'name', 'comments_enabled', 'comments_prompt', 'alert_threshold',
             'review_redirect_url', 'review_redirect_enabled',
@@ -134,16 +134,16 @@ class SurveySetWriteSerializer(serializers.ModelSerializer):
 
 # ── Public serializers (PWA) ──────────────────────────────────────────────────
 
-class SurveyPublicSerializer(serializers.ModelSerializer):
+class QuestionPublicSerializer(serializers.ModelSerializer):
     """One question as seen by the PWA survey stepper."""
     class Meta:
-        model = Survey
+        model = Question
         fields = ['id', 'question', 'scale_type', 'position']
 
 
-class SurveySetPublicSerializer(serializers.ModelSerializer):
-    """Full survey set as returned by the public NFC tap endpoint."""
-    surveys       = SurveyPublicSerializer(many=True, read_only=True)
+class SurveyPublicSerializer(serializers.ModelSerializer):
+    """Full survey as returned by the public NFC tap endpoint."""
+    questions     = QuestionPublicSerializer(many=True, read_only=True)
     brand_color   = serializers.CharField(source='organization.brand_color', read_only=True)
     org_name      = serializers.CharField(source='organization.name', read_only=True)
     logo_url      = serializers.CharField(source='organization.logo_url', read_only=True)
@@ -151,13 +151,13 @@ class SurveySetPublicSerializer(serializers.ModelSerializer):
     incentive     = serializers.SerializerMethodField()
 
     class Meta:
-        model = SurveySet
+        model = Survey
         fields = [
             'id', 'name', 'comments_enabled', 'comments_prompt',
             'brand_color', 'org_name', 'logo_url', 'location_name',
             'review_redirect_url', 'review_redirect_enabled',
             'incentive',
-            'surveys',
+            'questions',
         ]
 
     def get_location_name(self, obj):
@@ -175,15 +175,15 @@ class SurveySetPublicSerializer(serializers.ModelSerializer):
 
 class SingleResponseSerializer(serializers.Serializer):
     """One rating within a multi-question submission."""
-    survey_id = serializers.UUIDField()
-    rating    = serializers.IntegerField(min_value=1, max_value=5)
+    question_id = serializers.UUIDField()
+    rating      = serializers.IntegerField(min_value=1, max_value=5)
 
 
 class SurveyResponseSubmitSerializer(serializers.Serializer):
-    """Top-level submission payload for a full SurveySet tap."""
-    responses       = SingleResponseSerializer(many=True)
-    comment         = serializers.CharField(required=False, allow_blank=True, default='')
-    email           = serializers.EmailField(required=False, allow_blank=True, default='')
+    """Top-level submission payload for a full Survey tap."""
+    responses        = SingleResponseSerializer(many=True)
+    comment          = serializers.CharField(required=False, allow_blank=True, default='')
+    email            = serializers.EmailField(required=False, allow_blank=True, default='')
     marketing_opt_in = serializers.BooleanField(required=False, default=False)
 
     def validate_responses(self, value):
@@ -267,17 +267,17 @@ class UserSerializer(serializers.ModelSerializer):
 # ── Location ──────────────────────────────────────────────────────────────────
 
 class LocationSerializer(serializers.ModelSerializer):
-    nfc_url         = serializers.SerializerMethodField()
-    survey_set_name = serializers.CharField(source='survey_set.name', read_only=True)
-    survey_set      = serializers.PrimaryKeyRelatedField(
-        queryset=SurveySet.objects.all(),
+    nfc_url     = serializers.SerializerMethodField()
+    survey_name = serializers.CharField(source='survey.name', read_only=True)
+    survey      = serializers.PrimaryKeyRelatedField(
+        queryset=Survey.objects.all(),
         required=False,
         allow_null=True,
     )
 
     class Meta:
         model = Location
-        fields = ['id', 'name', 'survey_set', 'survey_set_name', 'nfc_url', 'qr_enabled', 'created_at']
+        fields = ['id', 'name', 'survey', 'survey_name', 'nfc_url', 'qr_enabled', 'created_at']
         read_only_fields = ['id', 'nfc_url', 'created_at']
 
     def get_nfc_url(self, obj):
@@ -287,10 +287,10 @@ class LocationSerializer(serializers.ModelSerializer):
             frontend_base = request.META.get('HTTP_X_FRONTEND_URL', frontend_base)
         return f"{frontend_base}/s/{obj.id}"
 
-    def validate_survey_set(self, value):
+    def validate_survey(self, value):
         if value is None:
             return value
         request = self.context.get('request')
         if value.organization != request.user.organization:
-            raise serializers.ValidationError('Survey set not found.')
+            raise serializers.ValidationError('Survey not found.')
         return value

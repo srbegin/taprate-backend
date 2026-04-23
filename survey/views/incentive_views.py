@@ -4,35 +4,26 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
-from ..models import Incentive, IncentiveWin, SurveySet
+from ..models import Incentive, IncentiveWin, Survey
 from ..serializers import IncentiveSerializer, IncentiveWinSerializer, RedeemSerializer
 
 
 # ── Incentive CRUD ─────────────────────────────────────────────────────────────
 
 class IncentiveListCreateView(generics.ListCreateAPIView):
-    """
-    GET  /api/incentives/        — list all incentives for the org
-    POST /api/incentives/        — create a new incentive
-    """
     serializer_class   = IncentiveSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         return Incentive.objects.filter(
             organization=self.request.user.organization
-        ).select_related('survey_set').order_by('-created_at')
+        ).select_related('survey').order_by('-created_at')
 
     def perform_create(self, serializer):
         serializer.save(organization=self.request.user.organization)
 
 
 class IncentiveDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """
-    GET    /api/incentives/<id>/  — retrieve
-    PATCH  /api/incentives/<id>/  — update
-    DELETE /api/incentives/<id>/  — delete
-    """
     serializer_class   = IncentiveSerializer
     permission_classes = [IsAuthenticated]
 
@@ -44,11 +35,11 @@ class IncentiveAssignView(APIView):
     """
     PATCH /api/incentives/<id>/assign/
 
-    Body: { "survey_set": "<uuid>" | null }
+    Body: { "survey": "<uuid>" | null }
 
-    Assigns or unassigns an incentive to a survey set.
-    Enforces single active incentive per survey set by deactivating any
-    previously assigned incentive on the target set.
+    Assigns or unassigns an incentive to a survey.
+    Enforces single active incentive per survey by detaching any
+    previously assigned incentive on the target survey.
     """
     permission_classes = [IsAuthenticated]
 
@@ -60,29 +51,28 @@ class IncentiveAssignView(APIView):
         except Incentive.DoesNotExist:
             return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        survey_set_id = request.data.get('survey_set')
+        survey_id = request.data.get('survey')
 
-        if survey_set_id is None:
-            # Unassign
-            incentive.survey_set = None
-            incentive.save(update_fields=['survey_set'])
+        if survey_id is None:
+            incentive.survey = None
+            incentive.save(update_fields=['survey'])
             return Response(IncentiveSerializer(incentive, context={'request': request}).data)
 
         try:
-            survey_set = SurveySet.objects.get(
-                id=survey_set_id, organization=request.user.organization
+            survey = Survey.objects.get(
+                id=survey_id, organization=request.user.organization
             )
-        except SurveySet.DoesNotExist:
-            return Response({'detail': 'Survey set not found.'}, status=status.HTTP_400_BAD_REQUEST)
+        except Survey.DoesNotExist:
+            return Response({'detail': 'Survey not found.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Detach any other active incentive currently assigned to this set
+        # Detach any other incentive currently assigned to this survey
         Incentive.objects.filter(
-            survey_set=survey_set,
+            survey=survey,
             organization=request.user.organization,
-        ).exclude(id=incentive.id).update(survey_set=None)
+        ).exclude(id=incentive.id).update(survey=None)
 
-        incentive.survey_set = survey_set
-        incentive.save(update_fields=['survey_set'])
+        incentive.survey = survey
+        incentive.save(update_fields=['survey'])
 
         return Response(IncentiveSerializer(incentive, context={'request': request}).data)
 
@@ -90,14 +80,6 @@ class IncentiveAssignView(APIView):
 # ── Redeem ─────────────────────────────────────────────────────────────────────
 
 class RedeemValidateView(APIView):
-    """
-    POST /api/redeem/
-
-    Body: { "code": "ABCD1234" }
-
-    Validates a win code belongs to the requesting user's org.
-    Returns win details without marking it redeemed.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -127,12 +109,6 @@ class RedeemValidateView(APIView):
 
 
 class RedeemUseView(APIView):
-    """
-    POST /api/redeem/<code>/use/
-
-    Marks a win code as redeemed. Idempotent — calling again returns the
-    existing redemption data rather than an error.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request, code):
@@ -152,8 +128,8 @@ class RedeemUseView(APIView):
             )
 
         if not win.redeemed_at:
-            win.redeemed_at  = timezone.now()
-            win.redeemed_by  = request.user
+            win.redeemed_at = timezone.now()
+            win.redeemed_by = request.user
             win.save(update_fields=['redeemed_at', 'redeemed_by'])
 
         return Response({
