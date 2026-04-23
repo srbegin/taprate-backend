@@ -7,8 +7,8 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from django.shortcuts import get_object_or_404
 
-from ..models import Location, Survey, SurveyResponse, Alert, IncentiveWin
-from ..serializers import SurveySetPublicSerializer, SurveyResponseSubmitSerializer
+from ..models import Location, Question, SurveyResponse, Alert, IncentiveWin
+from ..serializers import SurveyPublicSerializer, SurveyResponseSubmitSerializer
 
 
 def _generate_win_code():
@@ -22,27 +22,27 @@ def _generate_win_code():
 
 
 class PublicSurveyDetailView(APIView):
-    """GET /api/survey/<location_uuid>/ — load survey set for NFC tap."""
+    """GET /api/survey/<location_uuid>/ — load survey for NFC tap."""
     permission_classes = [AllowAny]
 
     def get(self, request, location_uuid):
         location = get_object_or_404(Location, id=location_uuid)
 
-        if not location.survey_set:
+        if not location.survey:
             return Response({
                 'location_id': str(location.id),
                 'location_name': location.name,
-                'survey_set': None,
+                'survey': None,
             })
 
-        serializer = SurveySetPublicSerializer(
-            location.survey_set,
+        serializer = SurveyPublicSerializer(
+            location.survey,
             context={'request': request, 'location': location},
         )
         return Response({
             'location_id': str(location.id),
             'location_name': location.name,
-            'survey_set': serializer.data,
+            'survey': serializer.data,
         })
 
 
@@ -50,9 +50,9 @@ class SurveyResponseView(APIView):
     """
     POST /api/survey/<location_uuid>/response/
 
-    Accepts a full SurveySet submission:
+    Accepts a full Survey submission:
     {
-        "responses": [{"survey_id": "<uuid>", "rating": 4}, ...],
+        "responses": [{"question_id": "<uuid>", "rating": 4}, ...],
         "comment": "optional",
         "email": "optional",
         "marketing_opt_in": false
@@ -65,9 +65,9 @@ class SurveyResponseView(APIView):
 
     def post(self, request, location_uuid):
         location = get_object_or_404(Location, id=location_uuid)
-        survey_set = location.survey_set
+        survey = location.survey
 
-        if not survey_set:
+        if not survey:
             return Response(
                 {'detail': 'No survey is configured for this location.'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -77,32 +77,32 @@ class SurveyResponseView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        validated       = serializer.validated_data
-        comment         = validated.get('comment', '')
-        email           = validated.get('email', '')
+        validated        = serializer.validated_data
+        comment          = validated.get('comment', '')
+        email            = validated.get('email', '')
         marketing_opt_in = validated.get('marketing_opt_in', False)
 
-        # Build a lookup of valid survey IDs in this set
-        valid_surveys = {
-            str(s.id): s
-            for s in survey_set.surveys.all()
+        # Build a lookup of valid question IDs in this survey
+        valid_questions = {
+            str(q.id): q
+            for q in survey.questions.all()
         }
 
-        # Validate all submitted survey_ids belong to this set
+        # Validate all submitted question_ids belong to this survey
         for resp_data in validated['responses']:
-            if str(resp_data['survey_id']) not in valid_surveys:
+            if str(resp_data['question_id']) not in valid_questions:
                 return Response(
-                    {'detail': f"Survey {resp_data['survey_id']} does not belong to this location."},
+                    {'detail': f"Question {resp_data['question_id']} does not belong to this survey."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # ── Incentive draw (once per session at set level) ─────────────────
-        incentive_won  = False
-        win_code       = None
-        winning_prize  = None
+        # ── Incentive draw (once per session) ─────────────────────────────
+        incentive_won     = False
+        win_code          = None
+        winning_prize     = None
         winning_incentive = None
 
-        active_incentive = survey_set.incentives.filter(active=True).first()
+        active_incentive = survey.incentives.filter(active=True).first()
         if active_incentive:
             won = random.randint(1, 100) <= active_incentive.win_rate
             if won:
@@ -116,17 +116,16 @@ class SurveyResponseView(APIView):
         created_responses = []
 
         for resp_data in validated['responses']:
-            survey = valid_surveys[str(resp_data['survey_id'])]
-            rating = resp_data['rating']
+            question = valid_questions[str(resp_data['question_id'])]
+            rating   = resp_data['rating']
             is_first = not created_responses
 
             response_obj = SurveyResponse.objects.create(
                 session_id=session_id,
                 location=location,
-                survey_set=survey_set,
                 survey=survey,
+                question=question,
                 rating=rating,
-                # Attach shared fields to the first response only
                 comment=comment if is_first else '',
                 email=email if is_first else '',
                 marketing_opt_in=marketing_opt_in if is_first else False,
@@ -134,8 +133,7 @@ class SurveyResponseView(APIView):
             )
             created_responses.append(response_obj)
 
-            # Alert if this individual rating is at or below the threshold
-            if rating <= survey_set.alert_threshold:
+            if rating <= survey.alert_threshold:
                 alert = Alert.objects.create(
                     survey_response=response_obj,
                     location=location,

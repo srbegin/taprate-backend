@@ -13,11 +13,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import Location, Survey, SurveySet, SurveyResponse, Alert
+from ..models import Location, Survey, Question, SurveyResponse, Alert
 from ..serializers import (
     LocationSerializer,
+    QuestionSerializer, QuestionWriteSerializer,
     SurveySerializer, SurveyWriteSerializer,
-    SurveySetSerializer, SurveySetWriteSerializer,
 )
 
 
@@ -29,7 +29,7 @@ class LocationListView(APIView):
     def get(self, request):
         locations = Location.objects.filter(
             organization=request.user.organization
-        ).select_related('survey_set').order_by('-created_at')
+        ).select_related('survey').order_by('-created_at')
         serializer = LocationSerializer(locations, many=True, context={'request': request})
         return Response(serializer.data)
 
@@ -62,106 +62,102 @@ class LocationDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Survey Sets ───────────────────────────────────────────────────────────────
+# ── Surveys ───────────────────────────────────────────────────────────────────
 
-class SurveySetListView(APIView):
+class SurveyListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        sets = SurveySet.objects.filter(
+        surveys = Survey.objects.filter(
             organization=request.user.organization
-        ).prefetch_related('surveys', 'incentives', 'locations').order_by('-created_at')
-        return Response(SurveySetSerializer(sets, many=True).data)
+        ).prefetch_related('questions', 'incentives', 'locations').order_by('-created_at')
+        return Response(SurveySerializer(surveys, many=True).data)
 
     def post(self, request):
         questions_data = request.data.pop('questions', [])
 
-        set_serializer = SurveySetWriteSerializer(data=request.data)
-        if not set_serializer.is_valid():
-            return Response(set_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer = SurveyWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        survey_set = set_serializer.save(organization=request.user.organization)
+        survey = serializer.save(organization=request.user.organization)
 
         for i, q_data in enumerate(questions_data):
             q_data.setdefault('position', i)
-            q_ser = SurveyWriteSerializer(data=q_data)
+            q_ser = QuestionWriteSerializer(data=q_data)
             if q_ser.is_valid():
                 q_ser.save(
-                    survey_set=survey_set,
+                    survey=survey,
                     organization=request.user.organization,
                 )
 
-        survey_set.refresh_from_db()
-        return Response(
-            SurveySetSerializer(survey_set).data,
-            status=status.HTTP_201_CREATED
-        )
+        survey.refresh_from_db()
+        return Response(SurveySerializer(survey).data, status=status.HTTP_201_CREATED)
 
 
-class SurveySetDetailView(APIView):
+class SurveyDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def _get_set(self, request, pk):
-        return get_object_or_404(SurveySet, id=pk, organization=request.user.organization)
+    def _get_survey(self, request, pk):
+        return get_object_or_404(Survey, id=pk, organization=request.user.organization)
 
     def get(self, request, pk):
-        return Response(SurveySetSerializer(self._get_set(request, pk)).data)
+        return Response(SurveySerializer(self._get_survey(request, pk)).data)
 
     def patch(self, request, pk):
-        survey_set = self._get_set(request, pk)
-        serializer = SurveySetWriteSerializer(survey_set, data=request.data, partial=True)
+        survey = self._get_survey(request, pk)
+        serializer = SurveyWriteSerializer(survey, data=request.data, partial=True)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        survey_set = serializer.save()
-        return Response(SurveySetSerializer(survey_set).data)
+        survey = serializer.save()
+        return Response(SurveySerializer(survey).data)
 
     def delete(self, request, pk):
-        self._get_set(request, pk).delete()
+        self._get_survey(request, pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Questions (nested under SurveySet) ───────────────────────────────────────
+# ── Questions (nested under Survey) ──────────────────────────────────────────
 
 class QuestionListView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def _get_set(self, request, set_pk):
-        return get_object_or_404(SurveySet, id=set_pk, organization=request.user.organization)
+    def _get_survey(self, request, survey_pk):
+        return get_object_or_404(Survey, id=survey_pk, organization=request.user.organization)
 
-    def post(self, request, set_pk):
-        survey_set = self._get_set(request, set_pk)
-        serializer = SurveyWriteSerializer(data=request.data)
+    def post(self, request, survey_pk):
+        survey = self._get_survey(request, survey_pk)
+        serializer = QuestionWriteSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         question = serializer.save(
-            survey_set=survey_set,
+            survey=survey,
             organization=request.user.organization,
         )
-        return Response(SurveySerializer(question).data, status=status.HTTP_201_CREATED)
+        return Response(QuestionSerializer(question).data, status=status.HTTP_201_CREATED)
 
 
 class QuestionDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def _get_question(self, request, set_pk, pk):
+    def _get_question(self, request, survey_pk, pk):
         return get_object_or_404(
-            Survey,
+            Question,
             id=pk,
-            survey_set_id=set_pk,
+            survey_id=survey_pk,
             organization=request.user.organization,
         )
 
-    def patch(self, request, set_pk, pk):
-        question = self._get_question(request, set_pk, pk)
-        serializer = SurveyWriteSerializer(question, data=request.data, partial=True)
+    def patch(self, request, survey_pk, pk):
+        question = self._get_question(request, survey_pk, pk)
+        serializer = QuestionWriteSerializer(question, data=request.data, partial=True)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        return Response(SurveySerializer(serializer.save()).data)
+        return Response(QuestionSerializer(serializer.save()).data)
 
-    def delete(self, request, set_pk, pk):
-        self._get_question(request, set_pk, pk).delete()
+    def delete(self, request, survey_pk, pk):
+        self._get_question(request, survey_pk, pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
-
 
 
 # ── Alerts ────────────────────────────────────────────────────────────────────
@@ -315,7 +311,7 @@ class CommentFeedView(APIView):
             SurveyResponse.objects
             .filter(location__organization=org)
             .exclude(comment='')
-            .select_related('location', 'survey_set')
+            .select_related('location', 'survey')
             .order_by('-created_at')
         )
 
@@ -352,7 +348,7 @@ class CommentFeedView(APIView):
                     'created_at': r.created_at.isoformat(),
                     'location_id': str(r.location.id),
                     'location_name': r.location.name,
-                    'survey_set_name': r.survey_set.name if r.survey_set else None,
+                    'survey_name': r.survey.name if r.survey else None,
                 }
                 for r in items
             ],
@@ -371,7 +367,6 @@ class OrganizationView(APIView):
         if not org:
             return Response({'detail': 'No organization found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Only these fields are user-editable
         allowed = {k: v for k, v in request.data.items() if k in ('name', 'brand_color', 'logo_url')}
 
         from ..serializers import OrganizationSerializer
@@ -381,20 +376,19 @@ class OrganizationView(APIView):
         serializer.save()
         return Response(serializer.data)
 
-        
 
 class QRCodeView(APIView):
     permission_classes = [IsAuthenticated]
- 
+
     def get(self, request, pk):
         location = get_object_or_404(Location, id=pk, organization=request.user.organization)
- 
+
         if not location.qr_enabled:
             return Response(
                 {'detail': 'QR code is not enabled for this location.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
- 
+
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_M,
@@ -403,12 +397,12 @@ class QRCodeView(APIView):
         )
         qr.add_data(location.nfc_url)
         qr.make(fit=True)
- 
+
         img = qr.make_image(fill_color='black', back_color='white')
         buf = io.BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
- 
+
         response = HttpResponse(buf, content_type='image/png')
         response['Content-Disposition'] = f'inline; filename="qr-{location.id}.png"'
         return response
