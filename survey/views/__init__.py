@@ -1,4 +1,4 @@
-from .tag_views import NfcTagView
+from .tag_views import NfcTagView, TagSessionView
 from .auth_views import RegisterView, LoginView, MeView, TokenRefreshView, ChangePasswordView
 from .admin_views import (
     AdminOverviewView,
@@ -8,7 +8,7 @@ from .admin_views import (
     AdminTagDetailView,
 )
 from .dashboard_views import (
-    LocationListView, LocationDetailView,
+    LocationListView, LocationDetailView, LocationPreviewView,
     SurveyListView, SurveyDetailView,
     QuestionListView, QuestionDetailView,
     CommentFeedView,

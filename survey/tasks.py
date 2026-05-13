@@ -74,6 +74,11 @@ def send_alert(self, alert_id):
         logger.warning(f'send_alert: Alert {alert_id} has no org — skipping')
         return
 
+    # Respect the org-level alerts toggle
+    if not org.alerts_enabled:
+        logger.info(f'send_alert: alerts disabled for org {org.id} — skipping')
+        return
+
     # Recipient: org.alert_email if set, otherwise the owner's email
     recipient = org.alert_email
     if not recipient:
