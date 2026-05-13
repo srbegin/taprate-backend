@@ -1,14 +1,14 @@
 from django.urls import path
 from .views import (
     RegisterView, LoginView, MeView, TokenRefreshView, ChangePasswordView,
-    LocationListView, LocationDetailView,
+    LocationListView, LocationDetailView, LocationPreviewView,
     SurveyListView, SurveyDetailView,
     QuestionListView, QuestionDetailView,
     AlertListView, AlertDetailView,
     InsightsView, CommentFeedView, OrganizationView,
     QRCodeView,
     PublicSurveyDetailView, SurveyResponseView,
-    NfcTagView,
+    NfcTagView, TagSessionView,
     AdminOverviewView,
     AdminOrganizationListView,
     AdminTagListView, AdminTagDetailView, AdminRecentSignupsView,
@@ -28,6 +28,7 @@ urlpatterns = [
     path('dashboard/locations/', LocationListView.as_view()),
     path('dashboard/locations/<uuid:pk>/', LocationDetailView.as_view()),
     path('dashboard/locations/<uuid:pk>/qr/', QRCodeView.as_view()),
+    path('dashboard/locations/<uuid:pk>/preview/', LocationPreviewView.as_view()),
     # Dashboard — surveys
     path('dashboard/surveys/', SurveyListView.as_view()),
     path('dashboard/surveys/<uuid:pk>/', SurveyDetailView.as_view()),
@@ -49,11 +50,12 @@ urlpatterns = [
     path('dashboard/incentives/<uuid:pk>/assign/', IncentiveAssignView.as_view()),
     path('dashboard/redeem/', RedeemValidateView.as_view()),
     path('dashboard/redeem/<str:code>/use/', RedeemUseView.as_view()),
-    # Public survey PWA
-    path('survey/<uuid:location_uuid>/', PublicSurveyDetailView.as_view()),
-    path('survey/<uuid:location_uuid>/response/', SurveyResponseView.as_view()),
-    # NFC tag claim
+    # Public survey PWA — session_token is a UUID string minted by TagSessionView
+    path('survey/<str:session_token>/', PublicSurveyDetailView.as_view()),
+    path('survey/<str:session_token>/response/', SurveyResponseView.as_view()),
+    # NFC tag claim + session mint
     path('tags/<uuid:tag_id>/', NfcTagView.as_view()),
+    path('tags/<uuid:tag_id>/session/', TagSessionView.as_view()),
     # Admin
     path('admin/overview/', AdminOverviewView.as_view()),
     path('admin/organizations/', AdminOrganizationListView.as_view()),

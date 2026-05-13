@@ -1,4 +1,5 @@
 import uuid
+import json
 import random
 import string
 from rest_framework.views import APIView
@@ -6,6 +7,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from django.shortcuts import get_object_or_404
+from django.core.cache import cache
 
 from ..models import Location, Question, SurveyResponse, Alert, IncentiveWin
 from ..serializers import SurveyPublicSerializer, SurveyResponseSubmitSerializer
@@ -21,12 +23,34 @@ def _generate_win_code():
     raise RuntimeError('Could not generate a unique win code after 20 attempts.')
 
 
+def _resolve_session(session_token):
+    """
+    Look up a session token in Redis.
+    Returns the Location object if valid, or None if expired/missing.
+    Does NOT delete the token — that happens on submit only.
+    """
+    raw = cache.get(f'survey_session:{session_token}')
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        location = Location.objects.get(id=data['location_id'])
+        return location
+    except (Location.DoesNotExist, KeyError, json.JSONDecodeError):
+        return None
+
+
 class PublicSurveyDetailView(APIView):
-    """GET /api/survey/<location_uuid>/ — load survey for NFC tap."""
+    """GET /api/survey/<session_token>/ — load survey for NFC tap."""
     permission_classes = [AllowAny]
 
-    def get(self, request, location_uuid):
-        location = get_object_or_404(Location, id=location_uuid)
+    def get(self, request, session_token):
+        location = _resolve_session(session_token)
+        if location is None:
+            return Response(
+                {'detail': 'Survey session has expired or is invalid. Please tap again.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         if not location.survey:
             return Response({
@@ -48,7 +72,7 @@ class PublicSurveyDetailView(APIView):
 
 class SurveyResponseView(APIView):
     """
-    POST /api/survey/<location_uuid>/response/
+    POST /api/survey/<session_token>/response/
 
     Accepts a full Survey submission:
     {
@@ -58,15 +82,21 @@ class SurveyResponseView(APIView):
         "marketing_opt_in": false
     }
 
+    Validates and deletes the session token (single-use).
     Creates one SurveyResponse per question, all sharing a session_id.
     Fires alerts and incentive draws as needed.
     """
     permission_classes = [AllowAny]
 
-    def post(self, request, location_uuid):
-        location = get_object_or_404(Location, id=location_uuid)
-        survey = location.survey
+    def post(self, request, session_token):
+        location = _resolve_session(session_token)
+        if location is None:
+            return Response(
+                {'detail': 'Survey session has expired or is invalid. Please tap again.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
+        survey = location.survey
         if not survey:
             return Response(
                 {'detail': 'No survey is configured for this location.'},
@@ -76,6 +106,11 @@ class SurveyResponseView(APIView):
         serializer = SurveyResponseSubmitSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── Consume the token before doing any writes ──────────────────────
+        # Deleting here means a duplicate POST with the same token gets 404,
+        # preventing double submissions even if the client retries.
+        cache.delete(f'survey_session:{session_token}')
 
         validated        = serializer.validated_data
         comment          = validated.get('comment', '')

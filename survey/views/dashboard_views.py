@@ -1,8 +1,12 @@
 import io
 import qrcode
 from django.http import HttpResponse
+from django.core.cache import cache
+import uuid as uuid_lib
+import json
 
 from datetime import timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db.models import Avg, Count, FloatField
 from django.db.models.functions import TruncDate
@@ -60,6 +64,28 @@ class LocationDetailView(APIView):
     def delete(self, request, pk):
         self._get_location(request, pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class LocationPreviewView(APIView):
+    """POST /api/dashboard/locations/<pk>/preview/ — mint a session for dashboard preview."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        location = get_object_or_404(
+            Location, id=pk, organization=request.user.organization
+        )
+        if not location.survey:
+            return Response(
+                {'detail': 'No survey assigned to this location.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        token = str(uuid_lib.uuid4())
+        cache.set(
+            f'survey_session:{token}',
+            json.dumps({'location_id': str(location.id), 'tag_id': None}),
+            60 * 30,
+        )
+        return Response({'token': token})
 
 
 # ── Surveys ───────────────────────────────────────────────────────────────────
@@ -209,6 +235,15 @@ class AlertDetailView(APIView):
 
 # ── Insights ──────────────────────────────────────────────────────────────────
 
+def _get_org_tz(org):
+    """Return a ZoneInfo object for the org's configured timezone, falling back to UTC."""
+    tz_string = (org.timezone or 'UTC') if org else 'UTC'
+    try:
+        return ZoneInfo(tz_string)
+    except (ZoneInfoNotFoundError, KeyError):
+        return ZoneInfo('UTC')
+
+
 class InsightsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -218,6 +253,8 @@ class InsightsView(APIView):
             days = min(int(request.query_params.get('days', 30)), 90)
         except (ValueError, TypeError):
             days = 30
+
+        local_tz = _get_org_tz(org)
 
         location_id = request.query_params.get('location')
         now = timezone.now()
@@ -237,9 +274,10 @@ class InsightsView(APIView):
         current_avg = round(current_agg['avg'] or 0, 2)
         previous_avg = round(previous_agg['avg'] or 0, 2)
 
+        # Group by local date using the org's timezone
         daily = (
             current_qs
-            .annotate(date=TruncDate('created_at'))
+            .annotate(date=TruncDate('created_at', tzinfo=local_tz))
             .values('date')
             .annotate(avg=Avg('rating', output_field=FloatField()), count=Count('id'))
             .order_by('date')
@@ -248,9 +286,12 @@ class InsightsView(APIView):
             row['date'].isoformat(): {'avg': round(row['avg'], 2), 'count': row['count']}
             for row in daily
         }
+
+        # Build the date series in local time so chart labels align with the org's clock
+        local_period_start = now.astimezone(local_tz) - timedelta(days=days)
         daily_series = []
         for i in range(days):
-            d = (period_start + timedelta(days=i)).date()
+            d = (local_period_start + timedelta(days=i)).date()
             key = d.isoformat()
             daily_series.append({
                 'date': key,
@@ -278,6 +319,7 @@ class InsightsView(APIView):
 
         return Response({
             'days': days,
+            'timezone': str(local_tz),
             'summary': {
                 'avg_rating': current_avg,
                 'avg_delta': round(current_avg - previous_avg, 2) if previous_avg else None,
@@ -355,6 +397,17 @@ class CommentFeedView(APIView):
         })
 
 
+# ── Organization ──────────────────────────────────────────────────────────────
+
+_ORG_WRITABLE_FIELDS = {
+    'name', 'brand_color', 'logo_url',
+    'alert_email', 'alerts_enabled',
+    'default_alert_threshold', 'default_review_url',
+    'default_comments_enabled', 'default_comments_prompt',
+    'timezone',
+}
+
+
 class OrganizationView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -367,7 +420,7 @@ class OrganizationView(APIView):
         if not org:
             return Response({'detail': 'No organization found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        allowed = {k: v for k, v in request.data.items() if k in ('name', 'brand_color', 'logo_url')}
+        allowed = {k: v for k, v in request.data.items() if k in _ORG_WRITABLE_FIELDS}
 
         from ..serializers import OrganizationSerializer
         serializer = OrganizationSerializer(org, data=allowed, partial=True)

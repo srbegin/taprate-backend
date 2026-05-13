@@ -200,11 +200,25 @@ class OrganizationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Organization
         fields = [
-            'id', 'name', 'slug', 'brand_color', 'logo_url',
-            'plan', 'subscription_status', 'trial_ends_at',
-            'trial_days_remaining',
+            # identity
+            'id', 'name', 'slug',
+            # branding
+            'brand_color', 'logo_url',
+            # billing (read-only)
+            'plan', 'subscription_status', 'trial_ends_at', 'trial_days_remaining',
+            # notifications
+            'alert_email', 'alerts_enabled',
+            # survey defaults
+            'default_alert_threshold', 'default_review_url',
+            'default_comments_enabled', 'default_comments_prompt',
+            'timezone',
         ]
         read_only_fields = ['id', 'slug', 'plan', 'subscription_status', 'trial_ends_at']
+
+    def validate_default_alert_threshold(self, value):
+        if not (1 <= value <= 5):
+            raise serializers.ValidationError('Must be between 1 and 5.')
+        return value
 
 
 class RegisterSerializer(serializers.Serializer):

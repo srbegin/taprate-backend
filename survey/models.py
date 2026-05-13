@@ -19,6 +19,7 @@ class Organization(models.Model):
     brand_color            = models.CharField(max_length=7, default='#0c0c0e')
     logo_url               = models.URLField(blank=True)
     plan                   = models.CharField(max_length=20, default='free')
+    # ── Billing ──────────────────────────────────────────────────────────────
     stripe_customer_id     = models.CharField(max_length=100, blank=True)
     stripe_subscription_id = models.CharField(max_length=100, blank=True)
     subscription_status    = models.CharField(
@@ -27,6 +28,36 @@ class Organization(models.Model):
                                  blank=True,
                              )
     trial_ends_at          = models.DateTimeField(null=True, blank=True)
+    # ── Notifications ─────────────────────────────────────────────────────────
+    alert_email            = models.EmailField(
+                                 blank=True,
+                                 help_text='Alert notification email. Falls back to owner account email if blank.',
+                             )
+    alerts_enabled         = models.BooleanField(
+                                 default=True,
+                                 help_text='Send email alerts when a low rating is received.',
+                             )
+    # ── Survey defaults (prefill new surveys, overridable per survey) ─────────
+    default_alert_threshold  = models.IntegerField(
+                                   default=2,
+                                   help_text='Default alert threshold for new surveys (1–5).',
+                               )
+    default_review_url       = models.URLField(
+                                   blank=True,
+                                   help_text='Default review redirect URL for new surveys.',
+                               )
+    default_comments_enabled = models.BooleanField(default=False)
+    default_comments_prompt  = models.CharField(
+                                   max_length=200,
+                                   default='Any additional feedback?',
+                                   blank=True,
+                               )
+    timezone                 = models.CharField(
+                                   max_length=50,
+                                   default='UTC',
+                                   blank=True,
+                                   help_text='IANA timezone string, e.g. America/New_York.',
+                               )
     created_at             = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
