@@ -15,7 +15,11 @@ PRICE_IDS = {
     'pro':     os.environ.get('STRIPE_PRICE_PRO'),
 }
 
+# ── Location limits per plan ───────────────────────────────────────────────────
+# This is the single source of truth for per-plan location caps.
+# None means unlimited. Import this in dashboard_views.py for the create guard.
 PLAN_LOCATION_LIMITS = {
+    'free':    1,
     'starter': 3,
     'growth':  10,
     'pro':     None,  # unlimited
@@ -165,20 +169,18 @@ class WebhookView(APIView):
             return
 
         stripe_status = subscription.get('status', '')
-        # Map Stripe status → our subscription_status choices
         status_map = {
-            'trialing':          'trialing',
-            'active':            'active',
-            'past_due':          'past_due',
-            'canceled':          'canceled',
-            'unpaid':            'unpaid',
-            'incomplete':        'past_due',
-            'incomplete_expired':'canceled',
-            'paused':            'canceled',
+            'trialing':           'trialing',
+            'active':             'active',
+            'past_due':           'past_due',
+            'canceled':           'canceled',
+            'unpaid':             'unpaid',
+            'incomplete':         'past_due',
+            'incomplete_expired': 'canceled',
+            'paused':             'canceled',
         }
         org.subscription_status = status_map.get(stripe_status, stripe_status)
 
-        # Derive plan from price ID
         items = subscription.get('items', {}).get('data', [])
         if items:
             price_id = items[0].get('price', {}).get('id')

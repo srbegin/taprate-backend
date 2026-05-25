@@ -1,5 +1,6 @@
 import io
 import qrcode
+import os
 from django.http import HttpResponse
 from django.core.cache import cache
 import uuid as uuid_lib
@@ -23,6 +24,7 @@ from ..serializers import (
     QuestionSerializer, QuestionWriteSerializer,
     SurveySerializer, SurveyWriteSerializer,
 )
+from .billing_views import PLAN_LOCATION_LIMITS
 
 
 # ── Locations ─────────────────────────────────────────────────────────────────
@@ -31,17 +33,46 @@ class LocationListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        org = request.user.organization
         locations = Location.objects.filter(
-            organization=request.user.organization
+            organization=org
         ).select_related('survey').order_by('-created_at')
         serializer = LocationSerializer(locations, many=True, context={'request': request})
-        return Response(serializer.data)
+
+        limit = PLAN_LOCATION_LIMITS.get(org.plan)
+        count = locations.count()
+
+        return Response({
+            'locations':      serializer.data,
+            'location_limit': limit,
+            'at_limit':       limit is not None and count >= limit,
+        })
 
     def post(self, request):
+        org = request.user.organization
+
+        # ── Plan limit guard ───────────────────────────────────────────────
+        limit = PLAN_LOCATION_LIMITS.get(org.plan)
+        if limit is not None:
+            current_count = Location.objects.filter(organization=org).count()
+            if current_count >= limit:
+                plan_display = org.plan.capitalize()
+                return Response(
+                    {
+                        'detail': (
+                            f'Your {plan_display} plan supports up to '
+                            f'{limit} location{"s" if limit != 1 else ""}. '
+                            f'Upgrade your plan to add more.'
+                        ),
+                        'code': 'location_limit_reached',
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
         serializer = LocationSerializer(data=request.data, context={'request': request})
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save(organization=request.user.organization)
+        serializer.save(organization=org)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -80,9 +111,11 @@ class LocationPreviewView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
         token = str(uuid_lib.uuid4())
+        # tag_id=None is the signal that marks this as a preview session.
+        # survey_views._resolve_session reads this and sets is_test=True on the response.
         cache.set(
             f'survey_session:{token}',
-            json.dumps({'location_id': str(location.id), 'tag_id': None}),
+            json.dumps({'location_id': str(location.id), 'tag_id': None, 'source': 'preview'}),
             60 * 30,
         )
         return Response({'token': token})
@@ -195,6 +228,8 @@ class AlertListView(APIView):
         status_filter = request.query_params.get('status', 'pending')
         qs = Alert.objects.filter(
             location__organization=request.user.organization,
+            survey_response__is_test=False,   # test responses never generate alerts,
+                                               # but guard here for belt-and-suspenders
         ).select_related('location', 'survey_response').order_by('-created_at')
         if status_filter != 'all':
             qs = qs.filter(status=status_filter)
@@ -203,13 +238,13 @@ class AlertListView(APIView):
     @staticmethod
     def _serialize(alert):
         return {
-            'id': str(alert.id),
-            'location': alert.location.name,
+            'id':          str(alert.id),
+            'location':    alert.location.name,
             'location_id': str(alert.location.id),
-            'rating': alert.rating,
-            'comment': alert.survey_response.comment,
-            'status': alert.status,
-            'created_at': alert.created_at.isoformat(),
+            'rating':      alert.rating,
+            'comment':     alert.survey_response.comment,
+            'status':      alert.status,
+            'created_at':  alert.created_at.isoformat(),
             'resolved_at': alert.resolved_at.isoformat() if alert.resolved_at else None,
         }
 
@@ -256,25 +291,38 @@ class InsightsView(APIView):
 
         local_tz = _get_org_tz(org)
 
-        location_id = request.query_params.get('location')
-        now = timezone.now()
+        location_id  = request.query_params.get('location')
+        now          = timezone.now()
         period_start = now - timedelta(days=days)
-        prev_start = period_start - timedelta(days=days)
+        prev_start   = period_start - timedelta(days=days)
 
-        base_qs = SurveyResponse.objects.filter(location__organization=org)
+        # Base queryset — real responses only
+        base_qs = SurveyResponse.objects.filter(
+            location__organization=org,
+            is_test=False,
+        )
         if location_id:
             base_qs = base_qs.filter(location_id=location_id)
 
-        current_qs = base_qs.filter(created_at__gte=period_start)
+        current_qs  = base_qs.filter(created_at__gte=period_start)
         previous_qs = base_qs.filter(created_at__gte=prev_start, created_at__lt=period_start)
 
-        current_agg = current_qs.aggregate(avg=Avg('rating', output_field=FloatField()), count=Count('id'))
+        current_agg  = current_qs.aggregate(avg=Avg('rating', output_field=FloatField()), count=Count('id'))
         previous_agg = previous_qs.aggregate(avg=Avg('rating', output_field=FloatField()), count=Count('id'))
 
-        current_avg = round(current_agg['avg'] or 0, 2)
+        current_avg  = round(current_agg['avg'] or 0, 2)
         previous_avg = round(previous_agg['avg'] or 0, 2)
 
-        # Group by local date using the org's timezone
+        # Count test responses in the same period so the frontend can surface a notice
+        test_qs = SurveyResponse.objects.filter(
+            location__organization=org,
+            is_test=True,
+            created_at__gte=period_start,
+        )
+        if location_id:
+            test_qs = test_qs.filter(location_id=location_id)
+        test_response_count = test_qs.count()
+
         daily = (
             current_qs
             .annotate(date=TruncDate('created_at', tzinfo=local_tz))
@@ -287,15 +335,14 @@ class InsightsView(APIView):
             for row in daily
         }
 
-        # Build the date series in local time so chart labels align with the org's clock
         local_period_start = now.astimezone(local_tz) - timedelta(days=days)
         daily_series = []
         for i in range(days):
-            d = (local_period_start + timedelta(days=i)).date()
+            d   = (local_period_start + timedelta(days=i)).date()
             key = d.isoformat()
             daily_series.append({
-                'date': key,
-                'avg': daily_map[key]['avg'] if key in daily_map else None,
+                'date':  key,
+                'avg':   daily_map[key]['avg']   if key in daily_map else None,
                 'count': daily_map[key]['count'] if key in daily_map else 0,
             })
 
@@ -312,30 +359,42 @@ class InsightsView(APIView):
             distribution[str(row['rating'])] = row['count']
 
         alert_qs = Alert.objects.filter(
-            location__organization=org, status__in=['pending', 'owner_notified']
+            location__organization=org,
+            status__in=['pending', 'owner_notified'],
+            survey_response__is_test=False,
         ).select_related('location').order_by('-created_at')
         if location_id:
             alert_qs = alert_qs.filter(location_id=location_id)
 
         return Response({
-            'days': days,
+            'days':     days,
             'timezone': str(local_tz),
             'summary': {
-                'avg_rating': current_avg,
-                'avg_delta': round(current_avg - previous_avg, 2) if previous_avg else None,
-                'total_responses': current_agg['count'],
-                'count_delta': current_agg['count'] - previous_agg['count'],
+                'avg_rating':          current_avg,
+                'avg_delta':           round(current_avg - previous_avg, 2) if previous_avg else None,
+                'total_responses':     current_agg['count'],
+                'count_delta':         current_agg['count'] - previous_agg['count'],
+                'test_response_count': test_response_count,  # frontend shows "N test responses excluded" when > 0
             },
             'daily_series': daily_series,
             'by_location': [
-                {'id': str(r['location__id']), 'name': r['location__name'],
-                 'avg': round(r['avg'], 2), 'count': r['count']}
+                {
+                    'id':    str(r['location__id']),
+                    'name':  r['location__name'],
+                    'avg':   round(r['avg'], 2),
+                    'count': r['count'],
+                }
                 for r in location_breakdown
             ],
-            'distribution': distribution,
+            'distribution':   distribution,
             'pending_alerts': [
-                {'id': str(a.id), 'location': a.location.name,
-                 'rating': a.rating, 'status': a.status, 'created_at': a.created_at.isoformat()}
+                {
+                    'id':         str(a.id),
+                    'location':   a.location.name,
+                    'rating':     a.rating,
+                    'status':     a.status,
+                    'created_at': a.created_at.isoformat(),
+                }
                 for a in alert_qs[:10]
             ],
         })
@@ -349,9 +408,13 @@ class CommentFeedView(APIView):
     def get(self, request):
         org = request.user.organization
 
+        # ?is_test=true shows test responses; default is real responses only.
+        # This lets owners verify their test submissions worked correctly.
+        show_test = request.query_params.get('is_test', 'false').lower() == 'true'
+
         qs = (
             SurveyResponse.objects
-            .filter(location__organization=org)
+            .filter(location__organization=org, is_test=show_test)
             .exclude(comment='')
             .select_related('location', 'survey')
             .order_by('-created_at')
@@ -362,35 +425,37 @@ class CommentFeedView(APIView):
             qs = qs.filter(location_id=location_id)
 
         date_from = request.query_params.get('date_from')
-        date_to = request.query_params.get('date_to')
+        date_to   = request.query_params.get('date_to')
         if date_from:
             qs = qs.filter(created_at__date__gte=date_from)
         if date_to:
             qs = qs.filter(created_at__date__lte=date_to)
 
         try:
-            page = max(int(request.query_params.get('page', 1)), 1)
+            page      = max(int(request.query_params.get('page', 1)), 1)
             page_size = min(int(request.query_params.get('page_size', 20)), 100)
         except (ValueError, TypeError):
             page, page_size = 1, 20
 
-        total = qs.count()
+        total  = qs.count()
         offset = (page - 1) * page_size
-        items = qs[offset:offset + page_size]
+        items  = qs[offset:offset + page_size]
 
         return Response({
-            'total': total,
-            'page': page,
+            'total':     total,
+            'page':      page,
             'page_size': page_size,
+            'is_test':   show_test,
             'results': [
                 {
-                    'id': str(r.id),
-                    'comment': r.comment,
-                    'rating': r.rating,
-                    'created_at': r.created_at.isoformat(),
-                    'location_id': str(r.location.id),
-                    'location_name': r.location.name,
-                    'survey_name': r.survey.name if r.survey else None,
+                    'id':            str(r.id),
+                    'comment':       r.comment,
+                    'rating':        r.rating,
+                    'is_test':       r.is_test,
+                    'created_at':    r.created_at.isoformat(),
+                    'location_id':   str(r.location.id) if r.location else None,
+                    'location_name': r.location.name if r.location else None,
+                    'survey_name':   r.survey.name if r.survey else None,
                 }
                 for r in items
             ],
@@ -405,6 +470,7 @@ _ORG_WRITABLE_FIELDS = {
     'default_alert_threshold', 'default_review_url',
     'default_comments_enabled', 'default_comments_prompt',
     'timezone',
+    'test_mode',   # owners toggle this from the settings page
 }
 
 
@@ -448,7 +514,8 @@ class QRCodeView(APIView):
             box_size=10,
             border=4,
         )
-        qr.add_data(location.nfc_url)
+        frontend_url = os.environ.get('FRONTEND_URL', 'https://taprate.app')
+        qr.add_data(f"{frontend_url}/qr/{location.id}") 
         qr.make(fit=True)
 
         img = qr.make_image(fill_color='black', back_color='white')

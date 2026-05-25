@@ -96,8 +96,8 @@ class QuestionWriteSerializer(serializers.ModelSerializer):
 
 class SurveySerializer(serializers.ModelSerializer):
     """Dashboard read serializer — includes nested questions, location count, active incentive."""
-    questions      = QuestionSerializer(many=True, read_only=True)
-    location_count = serializers.IntegerField(source='locations.count', read_only=True)
+    questions        = QuestionSerializer(many=True, read_only=True)
+    location_count   = serializers.IntegerField(source='locations.count', read_only=True)
     active_incentive = serializers.SerializerMethodField()
 
     class Meta:
@@ -106,6 +106,9 @@ class SurveySerializer(serializers.ModelSerializer):
             'id', 'name', 'comments_enabled', 'comments_prompt',
             'alert_threshold',
             'review_redirect_url', 'review_redirect_enabled',
+            # recovery
+            'recovery_enabled', 'recovery_threshold',
+            'recovery_message', 'recovery_coupon_text',
             'questions', 'location_count', 'active_incentive',
             'created_at',
         ]
@@ -124,11 +127,19 @@ class SurveyWriteSerializer(serializers.ModelSerializer):
         fields = [
             'name', 'comments_enabled', 'comments_prompt', 'alert_threshold',
             'review_redirect_url', 'review_redirect_enabled',
+            # recovery
+            'recovery_enabled', 'recovery_threshold',
+            'recovery_message', 'recovery_coupon_text',
         ]
 
     def validate_alert_threshold(self, value):
         if not (1 <= value <= 5):
             raise serializers.ValidationError('Alert threshold must be between 1 and 5.')
+        return value
+
+    def validate_recovery_threshold(self, value):
+        if not (1 <= value <= 5):
+            raise serializers.ValidationError('Recovery threshold must be between 1 and 5.')
         return value
 
 
@@ -157,6 +168,9 @@ class SurveyPublicSerializer(serializers.ModelSerializer):
             'brand_color', 'org_name', 'logo_url', 'location_name',
             'review_redirect_url', 'review_redirect_enabled',
             'incentive',
+            # recovery
+            'recovery_enabled', 'recovery_threshold',
+            'recovery_message', 'recovery_coupon_text',
             'questions',
         ]
 
@@ -185,6 +199,9 @@ class SurveyResponseSubmitSerializer(serializers.Serializer):
     comment          = serializers.CharField(required=False, allow_blank=True, default='')
     email            = serializers.EmailField(required=False, allow_blank=True, default='')
     marketing_opt_in = serializers.BooleanField(required=False, default=False)
+    # Recovery flow fields — only populated when the recovery step is shown
+    recovery_comment = serializers.CharField(required=False, allow_blank=True, default='')
+    recovery_email   = serializers.EmailField(required=False, allow_blank=True, default='')
 
     def validate_responses(self, value):
         if not value:
@@ -196,6 +213,7 @@ class SurveyResponseSubmitSerializer(serializers.Serializer):
 
 class OrganizationSerializer(serializers.ModelSerializer):
     trial_days_remaining = serializers.IntegerField(read_only=True)
+    location_count       = serializers.SerializerMethodField()
 
     class Meta:
         model = Organization
@@ -206,14 +224,22 @@ class OrganizationSerializer(serializers.ModelSerializer):
             'brand_color', 'logo_url',
             # billing (read-only)
             'plan', 'subscription_status', 'trial_ends_at', 'trial_days_remaining',
+            'location_count',
             # notifications
             'alert_email', 'alerts_enabled',
             # survey defaults
             'default_alert_threshold', 'default_review_url',
             'default_comments_enabled', 'default_comments_prompt',
             'timezone',
+            'test_mode',
         ]
-        read_only_fields = ['id', 'slug', 'plan', 'subscription_status', 'trial_ends_at']
+        read_only_fields = [
+            'id', 'slug', 'plan', 'subscription_status',
+            'trial_ends_at', 'location_count',
+        ]
+
+    def get_location_count(self, obj):
+        return obj.locations.count()
 
     def validate_default_alert_threshold(self, value):
         if not (1 <= value <= 5):
