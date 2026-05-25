@@ -7,11 +7,10 @@ from .views import (
     AlertListView, AlertDetailView,
     InsightsView, CommentFeedView, OrganizationView,
     QRCodeView,
-    PublicSurveyDetailView, SurveyResponseView,
+    PublicSurveyDetailView, SurveyResponseView, QrSessionView,
     NfcTagView, TagSessionView,
-    AdminOverviewView,
-    AdminOrganizationListView,
-    AdminTagListView, AdminTagDetailView, AdminRecentSignupsView,
+    AdminOverviewView, AdminOrganizationListView, AdminOrgDetailView, AdminOrgTagsView,
+    AdminTagListView, AdminTagDetailView, AdminRecentSignupsView, AdminOrgLocationsView,
     CheckoutView, PortalView, WebhookView,
     IncentiveListCreateView, IncentiveDetailView, IncentiveAssignView,
     RedeemValidateView, RedeemUseView,
@@ -53,6 +52,7 @@ urlpatterns = [
     # Public survey PWA — session_token is a UUID string minted by TagSessionView
     path('survey/<str:session_token>/', PublicSurveyDetailView.as_view()),
     path('survey/<str:session_token>/response/', SurveyResponseView.as_view()),
+    path('survey/location/<uuid:location_id>/session/', QrSessionView.as_view()),
     # NFC tag claim + session mint
     path('tags/<uuid:tag_id>/', NfcTagView.as_view()),
     path('tags/<uuid:tag_id>/session/', TagSessionView.as_view()),
@@ -62,6 +62,9 @@ urlpatterns = [
     path('admin/tags/', AdminTagListView.as_view()),
     path('admin/signups/', AdminRecentSignupsView.as_view()),
     path('admin/tags/<uuid:tag_id>/release/', AdminTagDetailView.as_view()),
+    path('admin/orgs/<uuid:org_id>/',            AdminOrgDetailView.as_view()),
+    path('admin/orgs/<uuid:org_id>/tags/',       AdminOrgTagsView.as_view()),
+    path('admin/orgs/<uuid:org_id>/locations/', AdminOrgLocationsView.as_view()),
     # Billing
     path('billing/checkout/', CheckoutView.as_view()),
     path('billing/portal/', PortalView.as_view()),

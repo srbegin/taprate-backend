@@ -58,6 +58,14 @@ class Organization(models.Model):
                                    blank=True,
                                    help_text='IANA timezone string, e.g. America/New_York.',
                                )
+    # ── Testing ───────────────────────────────────────────────────────────────
+    test_mode              = models.BooleanField(
+                                 default=False,
+                                 help_text=(
+                                     'When enabled, all survey submissions are marked as test '
+                                     'responses and excluded from analytics, insights, and alert emails.'
+                                 ),
+                             )
     created_at             = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -77,9 +85,18 @@ class Organization(models.Model):
         return max(0, delta.days)
 
 
+# ── NOTE: Organization deletion ───────────────────────────────────────────────
+# Deleting an Organization cascades to Location (intended — org owns its
+# locations). With SurveyResponse.location = SET_NULL, responses survive as
+# org-less orphans rather than being wiped. This is acceptable for data
+# integrity, but org deletion should be performed via a management command
+# that handles cleanup explicitly rather than from the Django admin or shell.
+
+
 class User(AbstractUser):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
+        # SET_NULL: users survive org deletion (they just lose their org context).
         Organization, null=True, blank=True,
         on_delete=models.SET_NULL, related_name='members'
     )
@@ -114,6 +131,25 @@ class Survey(models.Model):
     )
     review_redirect_enabled = models.BooleanField(default=False)
     review_redirect_url     = models.URLField(blank=True)
+    # ── Recovery flow ─────────────────────────────────────────────────────────
+    recovery_enabled   = models.BooleanField(
+                             default=False,
+                             help_text='Show a recovery prompt when a low rating is submitted.',
+                         )
+    recovery_threshold = models.IntegerField(
+                             default=3,
+                             help_text='Trigger recovery prompt when rating is at or below this value (1–5).',
+                         )
+    recovery_message   = models.TextField(
+                             default="We're sorry your experience fell short. Tell us what happened and we'll make it right.",
+                             blank=True,
+                             help_text='Message shown to the customer on the recovery step.',
+                         )
+    recovery_coupon_text = models.CharField(
+                               max_length=200,
+                               blank=True,
+                               help_text='Coupon or offer shown as the incentive to share an email (e.g. "10% off your next visit").',
+                           )
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -138,6 +174,8 @@ class Question(models.Model):
         on_delete=models.CASCADE, related_name='questions'
     )
     survey = models.ForeignKey(
+        # CASCADE: questions are structural parts of a survey, not independent
+        # records. Deleting a survey deletes its questions.
         Survey, null=True, blank=True,
         on_delete=models.CASCADE, related_name='questions'
     )
@@ -161,6 +199,7 @@ class Incentive(models.Model):
         Organization, on_delete=models.CASCADE, related_name='incentives'
     )
     survey = models.ForeignKey(
+        # SET_NULL: detach from survey rather than delete.
         Survey, null=True, blank=True,
         on_delete=models.SET_NULL, related_name='incentives'
     )
@@ -178,8 +217,14 @@ class Incentive(models.Model):
 
 class IncentiveWin(models.Model):
     id               = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    incentive        = models.ForeignKey(Incentive, on_delete=models.CASCADE, related_name='wins')
-    survey_response  = models.ForeignKey('SurveyResponse', on_delete=models.CASCADE, related_name='wins')
+    incentive        = models.ForeignKey(
+                           # SET_NULL: win records are permanent audit entries.
+                           Incentive, null=True, blank=True,
+                           on_delete=models.SET_NULL, related_name='wins'
+                       )
+    survey_response  = models.ForeignKey(
+                           'SurveyResponse', on_delete=models.CASCADE, related_name='wins'
+                       )
     redeemed_by      = models.ForeignKey(
                            'User', null=True, blank=True,
                            on_delete=models.SET_NULL, related_name='redemptions'
@@ -191,16 +236,18 @@ class IncentiveWin(models.Model):
     created_at       = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.code} — {self.incentive.name}"
+        return f"{self.code} — {self.incentive.name if self.incentive else 'deleted incentive'}"
 
 
 class NfcTag(models.Model):
     id           = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
+                       # SET_NULL: tags are physical hardware; survive org deletion.
                        Organization, null=True, blank=True,
                        on_delete=models.SET_NULL, related_name='nfc_tags'
                    )
     location     = models.OneToOneField(
+                       # SET_NULL: tag survives location deletion, becomes unclaimed.
                        'Location', null=True, blank=True,
                        on_delete=models.SET_NULL, related_name='nfc_tag'
                    )
@@ -214,9 +261,11 @@ class NfcTag(models.Model):
 class Location(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
+        # CASCADE: locations are owned by the org.
         Organization, on_delete=models.CASCADE, related_name='locations'
     )
     survey = models.ForeignKey(
+        # SET_NULL: location survives survey deletion, just loses its survey.
         Survey, null=True, blank=True,
         on_delete=models.SET_NULL, related_name='locations'
     )
@@ -248,10 +297,16 @@ class Location(models.Model):
             count=models.Count('id')
         )
 
+
 class SurveyResponse(models.Model):
     id               = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     session_id       = models.UUIDField(null=True, blank=True, db_index=True)
-    location         = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='responses')
+    location         = models.ForeignKey(
+                           # SET_NULL: responses are permanent audit records and must survive
+                           # location deletion.
+                           Location, null=True, blank=True,
+                           on_delete=models.SET_NULL, related_name='responses'
+                       )
     survey           = models.ForeignKey(
                            Survey, null=True, blank=True,
                            on_delete=models.SET_NULL, related_name='responses'
@@ -266,13 +321,28 @@ class SurveyResponse(models.Model):
     marketing_opt_in = models.BooleanField(default=False)
     incentive_won    = models.BooleanField(default=False)
     incentive_claimed = models.BooleanField(default=False)
+    # ── Recovery flow ─────────────────────────────────────────────────────────
+    recovery_triggered = models.BooleanField(default=False)
+    recovery_comment   = models.TextField(blank=True)
+    recovery_email     = models.EmailField(blank=True)
+    # ── Testing ───────────────────────────────────────────────────────────────
+    is_test          = models.BooleanField(
+                           default=False,
+                           db_index=True,
+                           help_text=(
+                               'True when submitted via dashboard preview or while org '
+                               'test_mode is enabled. Excluded from analytics and alert emails.'
+                           ),
+                       )
+    # ── Meta ──────────────────────────────────────────────────────────────────
     ip_hash          = models.CharField(max_length=64, blank=True)
     device_hash      = models.CharField(max_length=64, blank=True)
     user_agent       = models.CharField(max_length=500, blank=True)
     created_at       = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"Response {self.id} — {self.rating}★"
+        marker = ' [TEST]' if self.is_test else ''
+        return f"Response {self.id} — {self.rating}★{marker}"
 
 
 class Alert(models.Model):
@@ -284,8 +354,15 @@ class Alert(models.Model):
     ]
 
     id              = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    survey_response = models.ForeignKey(SurveyResponse, on_delete=models.CASCADE, related_name='alerts')
-    location        = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='alerts')
+    survey_response = models.ForeignKey(
+                          # CASCADE: alerts are operational items. If the response is gone,
+                          # the alert has no context.
+                          SurveyResponse, on_delete=models.CASCADE, related_name='alerts'
+                      )
+    location        = models.ForeignKey(
+                          # CASCADE: an alert without a location is unactionable.
+                          Location, on_delete=models.CASCADE, related_name='alerts'
+                      )
     rating          = models.IntegerField()
     status          = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     created_at      = models.DateTimeField(auto_now_add=True)

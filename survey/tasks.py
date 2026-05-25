@@ -37,8 +37,6 @@ def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> boo
             'html': html_body,
             'text': text_body,
         })
-        # Resend raises on error; if we get here it succeeded.
-        # response is a dict with an 'id' key on success.
         if not response.get('id'):
             logger.error(f'Resend returned unexpected response: {response}')
             return False
@@ -53,9 +51,14 @@ def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> boo
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def send_alert(self, alert_id):
     """
-    Triggered when a SurveyResponse rating falls at or below the survey set's
+    Triggered when a SurveyResponse rating falls at or below the survey's
     alert_threshold. Sends an email to the organization's alert_email address,
     falling back to the owner account email if none is set.
+
+    If the response also triggered the recovery flow, the alert email includes
+    a recovery block showing the customer's comment and email so the owner
+    can follow up directly.
+
     Sets alert.status = 'owner_notified' on successful send.
     """
     from .models import Alert, User
@@ -88,20 +91,79 @@ def send_alert(self, alert_id):
             return
         recipient = owner.email
 
-    location_name = alert.location.name
-    rating = alert.rating
-    stars = '★' * rating + '☆' * (5 - rating)
-    dashboard_url = os.environ.get('FRONTEND_URL', 'https://taprate.app') + '/dashboard/insights'
-    comment = alert.survey_response.comment or ''
+    survey_response   = alert.survey_response
+    location_name     = alert.location.name
+    rating            = alert.rating
+    stars             = '★' * rating + '☆' * (5 - rating)
+    dashboard_url     = os.environ.get('FRONTEND_URL', 'https://taprate.app') + '/dashboard/insights'
+    comment           = survey_response.comment or ''
+
+    # Recovery fields
+    recovery_triggered  = survey_response.recovery_triggered
+    recovery_comment    = survey_response.recovery_comment or ''
+    recovery_email_addr = survey_response.recovery_email or ''
 
     subject = f"Low rating alert — {location_name} ({rating}/5)"
 
-    text_body = (
-        f"A low rating was submitted at {location_name}.\n\n"
-        f"Rating: {rating}/5\n"
-        f"Location: {location_name}\n"
-        + (f"Comment: {comment}\n" if comment else "")
-        + f"\nView your dashboard: {dashboard_url}"
+    # ── Plain-text body ────────────────────────────────────────────────────
+    text_lines = [
+        f"A low rating was submitted at {location_name}.",
+        '',
+        f"Rating: {rating}/5",
+        f"Location: {location_name}",
+    ]
+    if comment:
+        text_lines.append(f"Comment: {comment}")
+    if recovery_triggered:
+        text_lines += [
+            '',
+            '── Customer recovery response ──',
+        ]
+        if recovery_comment:
+            text_lines.append(f"What went wrong: {recovery_comment}")
+        if recovery_email_addr:
+            text_lines.append(f"Customer email: {recovery_email_addr}")
+        else:
+            text_lines.append("Customer did not provide an email.")
+    text_lines += ['', f"View your dashboard: {dashboard_url}"]
+    text_body = '\n'.join(text_lines)
+
+    # ── Recovery block HTML (conditionally included) ───────────────────────
+    if recovery_triggered:
+        recovery_comment_html = (
+            f'<p style="margin: 10px 0 0; font-size: 14px; color: #374151;">'
+            f'<strong>What went wrong:</strong> {recovery_comment}</p>'
+            if recovery_comment else ''
+        )
+        recovery_email_html = (
+            f'<p style="margin: 8px 0 0; font-size: 14px; color: #374151;">'
+            f'<strong>Customer email:</strong> '
+            f'<a href="mailto:{recovery_email_addr}" style="color: #2563eb;">{recovery_email_addr}</a></p>'
+            if recovery_email_addr
+            else '<p style="margin: 8px 0 0; font-size: 13px; color: #9ca3af;">Customer did not provide an email.</p>'
+        )
+        recovery_block_html = f"""
+      <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 12px;
+                  padding: 16px 20px; margin-bottom: 24px;">
+        <p style="margin: 0 0 6px; font-size: 11px; letter-spacing: 0.08em;
+                  text-transform: uppercase; color: #92400e; font-weight: 600;">
+          Customer requested follow-up
+        </p>
+        <p style="margin: 0; font-size: 13px; color: #78350f; line-height: 1.5;">
+          This customer used the recovery prompt. Reply to their email with the coupon offer
+          to turn this experience around.
+        </p>
+        {recovery_comment_html}
+        {recovery_email_html}
+      </div>
+        """
+    else:
+        recovery_block_html = ''
+
+    # ── HTML body ──────────────────────────────────────────────────────────
+    comment_html = (
+        f'<p style="margin: 12px 0 0; font-size: 14px; color: #555; font-style: italic;">"{comment}"</p>'
+        if comment else ''
     )
 
     html_body = f"""
@@ -123,8 +185,10 @@ def send_alert(self, alert_id):
           {stars}
         </p>
         <p style="margin: 0; font-size: 13px; color: #888;">{rating} out of 5</p>
-        {f'<p style="margin: 12px 0 0; font-size: 14px; color: #555; font-style: italic;">"{comment}"</p>' if comment else ''}
+        {comment_html}
       </div>
+
+      {recovery_block_html}
 
       <a href="{dashboard_url}"
          style="display: inline-block; background: #111; color: #fff; text-decoration: none;

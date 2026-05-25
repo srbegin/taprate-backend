@@ -6,6 +6,7 @@ from .admin_views import (
     AdminTagListView,
     AdminRecentSignupsView,
     AdminTagDetailView,
+    AdminOrgDetailView, AdminOrgTagsView, AdminOrgLocationsView
 )
 from .dashboard_views import (
     LocationListView, LocationDetailView, LocationPreviewView,
@@ -23,4 +24,4 @@ from .incentive_views import (
     RedeemUseView,
 )
 from .billing_views import CheckoutView, PortalView, WebhookView
-from .survey_views import PublicSurveyDetailView, SurveyResponseView
+from .survey_views import PublicSurveyDetailView, SurveyResponseView, QrSessionView
