@@ -29,10 +29,24 @@ SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
     if not DEBUG:
         raise ImproperlyConfigured('SECRET_KEY must be set when DEBUG is off.')
-    SECRET_KEY = 'django-insecure-local-dev-only'
+    SECRET_KEY = 'django-insecure-local-dev-only-never-use-in-production'
 
 # Empty + DEBUG=True → Django allows localhost / 127.0.0.1 / [::1].
 ALLOWED_HOSTS = [h for h in os.environ.get('ALLOWED_HOSTS', '').split(',') if h]
+
+if not DEBUG:
+    # Fly terminates TLS and forwards X-Forwarded-Proto.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SESSION_COOKIE_SECURE   = True
+    CSRF_COOKIE_SECURE      = True
+    SECURE_HSTS_SECONDS     = 60 * 60 * 24 * 365
+    SILENCED_SYSTEM_CHECKS  = [
+        # HTTP→HTTPS redirect happens at Fly's edge (force_https in fly.toml).
+        'security.W008',
+        # HSTS includeSubDomains/preload: the API lives on a fly.dev subdomain we
+        # don't control the parent of (and .dev is already HSTS-preloaded).
+        'security.W005', 'security.W021',
+    ]
 
 
 # Redis cache for rate limiting
@@ -90,6 +104,7 @@ CORS_ALLOW_METHODS = ['DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = [
     'content-type',
     'authorization',
+    'x-product',   # which product (cleanpulse / taprate) a dashboard request is for
 ]
 
 CSRF_TRUSTED_ORIGINS = [
@@ -225,7 +240,10 @@ if _csrf:
 # Static files (whitenoise)
 MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+STORAGES = {
+    'default':     {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage'},
+}
 
 # LOGGING = {
 #     'version': 1,
