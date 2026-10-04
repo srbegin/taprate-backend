@@ -13,21 +13,26 @@ from dotenv import load_dotenv
 load_dotenv()
 import os
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-# Quick-start development settings - unsuitable for production
+# ── Core security settings (env-driven, safe by default) ──
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+# Local dev sets DEBUG=True in .env; production sets all three as Fly secrets.
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-z=3_-dklab9g*yi#1kj=a0cb-ri1^vj-#5*%1be!tqj2^0^--+'
+DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+SECRET_KEY = os.environ.get('SECRET_KEY')
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured('SECRET_KEY must be set when DEBUG is off.')
+    SECRET_KEY = 'django-insecure-local-dev-only'
 
-ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '*']
+# Empty + DEBUG=True → Django allows localhost / 127.0.0.1 / [::1].
+ALLOWED_HOSTS = [h for h in os.environ.get('ALLOWED_HOSTS', '').split(',') if h]
 
 
 # Redis cache for rate limiting
@@ -67,7 +72,6 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'allauth.account.middleware.AccountMiddleware',
-    'django.middleware.common.CommonMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -196,18 +200,6 @@ STATIC_URL = 'static/'
 
 
 # ── Production overrides (only apply when env vars are set) ──
-_secret = os.environ.get('SECRET_KEY')
-if _secret:
-    SECRET_KEY = _secret
-
-_debug = os.environ.get('DEBUG')
-if _debug is not None:
-    DEBUG = _debug == 'True'
-
-_hosts = os.environ.get('ALLOWED_HOSTS')
-if _hosts:
-    ALLOWED_HOSTS = [h for h in _hosts.split(',') if h]
-
 # Database — override with Fly Postgres URL
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if DATABASE_URL:
@@ -273,28 +265,3 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 #         },
 #     },
 # }
-# SECRET_KEY = os.environ.get('SECRET_KEY', SECRET_KEY)
-# DEBUG = os.environ.get('DEBUG', 'False') == 'True'
-# ALLOWED_HOSTS = [h for h in os.environ.get('ALLOWED_HOSTS', 'localhost').split(',') if h]
-
-# # Database — override with Fly Postgres URL
-# DATABASE_URL = os.environ.get('DATABASE_URL')
-# if DATABASE_URL:
-#     import dj_database_url
-#     DATABASES['default'] = dj_database_url.parse(DATABASE_URL, conn_max_age=600)
-
-# # Redis — override with Fly/Upstash URL
-# REDIS_URL = os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0')
-# CACHES['default']['LOCATION'] = REDIS_URL
-# CELERY_BROKER_URL = REDIS_URL
-# CELERY_RESULT_BACKEND = REDIS_URL
-
-# # CORS
-# CORS_ALLOWED_ORIGINS = [o for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o]
-
-# # Static files (whitenoise)
-# MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
-# STATIC_ROOT = BASE_DIR / 'staticfiles'
-# STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
-
-# DEBUG = True
