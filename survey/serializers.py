@@ -1,5 +1,6 @@
 import uuid
 import os
+from datetime import timedelta
 from django.utils.text import slugify
 from django.utils import timezone
 from rest_framework import serializers
@@ -214,6 +215,7 @@ class SurveyResponseSubmitSerializer(serializers.Serializer):
 class OrganizationSerializer(serializers.ModelSerializer):
     trial_days_remaining = serializers.IntegerField(read_only=True)
     location_count       = serializers.SerializerMethodField()
+    overage_count        = serializers.SerializerMethodField()  
 
     class Meta:
         model = Organization
@@ -225,6 +227,7 @@ class OrganizationSerializer(serializers.ModelSerializer):
             # billing (read-only)
             'plan', 'subscription_status', 'trial_ends_at', 'trial_days_remaining',
             'location_count',
+            'overage_count',  
             # notifications
             'alert_email', 'alerts_enabled',
             # survey defaults
@@ -241,9 +244,30 @@ class OrganizationSerializer(serializers.ModelSerializer):
     def get_location_count(self, obj):
         return obj.locations.count()
 
+    def get_overage_count(self, obj):                            # ← ADD
+        from .views.billing_views import PLAN_BASE_LOCATIONS
+        base = PLAN_BASE_LOCATIONS.get(obj.plan)
+        if base is None:
+            return 0
+        count = obj.locations.count()
+        return max(0, count - base)
+
     def validate_default_alert_threshold(self, value):
         if not (1 <= value <= 5):
             raise serializers.ValidationError('Must be between 1 and 5.')
+        return value
+
+    def validate_logo_url(self, value):
+        if not value:
+            return value  # blank/null allowed
+        if len(value) > 500:
+            raise serializers.ValidationError('Logo URL must be 500 characters or fewer.')
+        if not value.startswith('https://'):
+            raise serializers.ValidationError('Logo URL must use HTTPS.')
+        try:
+            URLValidator(schemes=['https'])(value)
+        except DjangoValidationError:
+            raise serializers.ValidationError('Logo URL is not a valid URL.')
         return value
 
 
@@ -268,9 +292,6 @@ class RegisterSerializer(serializers.Serializer):
         return value.lower()
 
     def create(self, validated_data):
-        import os
-        from datetime import timedelta
-
         trial_days = int(os.environ.get('TRIAL_DAYS', 30))
 
         base_slug = slugify(validated_data['org_name'])
@@ -282,6 +303,7 @@ class RegisterSerializer(serializers.Serializer):
             name=validated_data['org_name'],
             slug=slug,
             trial_ends_at=timezone.now() + timedelta(days=trial_days),
+            subscription_status='trialing',
         )
         user = User.objects.create_user(
             username=validated_data['email'],

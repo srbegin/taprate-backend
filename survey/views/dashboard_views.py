@@ -18,19 +18,22 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from ..permissions import HasActiveAccess
 from ..models import Location, Survey, Question, SurveyResponse, Alert
 from ..serializers import (
-    LocationSerializer,
+    LocationSerializer, OrganizationSerializer,
     QuestionSerializer, QuestionWriteSerializer,
     SurveySerializer, SurveyWriteSerializer,
 )
-from .billing_views import PLAN_LOCATION_LIMITS
+from ..utils.responses import list_response
+from .billing_views import PLAN_BASE_LOCATIONS, OVERAGE_PRICE_PER_LOCATION, _sync_overage_quantity
+
 
 
 # ── Locations ─────────────────────────────────────────────────────────────────
 
 class LocationListView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
         org = request.user.organization
@@ -39,48 +42,44 @@ class LocationListView(APIView):
         ).select_related('survey').order_by('-created_at')
         serializer = LocationSerializer(locations, many=True, context={'request': request})
 
-        limit = PLAN_LOCATION_LIMITS.get(org.plan)
         count = locations.count()
+        base  = PLAN_BASE_LOCATIONS.get(org.plan)  # None for trial/free — no cap
+        overage_count = max(0, count - base) if base is not None else 0
+        overage_cost  = overage_count * OVERAGE_PRICE_PER_LOCATION
 
-        return Response({
-            'locations':      serializer.data,
-            'location_limit': limit,
-            'at_limit':       limit is not None and count >= limit,
-        })
+        return Response(list_response(
+            serializer.data,
+            base_locations=base,
+            overage_count=overage_count,
+            overage_monthly_cost=overage_cost,
+            # at_limit kept for ClaimTagClient — only true on paid plans at their base
+            at_limit=False,
+        ))
 
     def post(self, request):
         org = request.user.organization
-
-        # ── Plan limit guard ───────────────────────────────────────────────
-        limit = PLAN_LOCATION_LIMITS.get(org.plan)
-        if limit is not None:
-            current_count = Location.objects.filter(organization=org).count()
-            if current_count >= limit:
-                plan_display = org.plan.capitalize()
-                return Response(
-                    {
-                        'detail': (
-                            f'Your {plan_display} plan supports up to '
-                            f'{limit} location{"s" if limit != 1 else ""}. '
-                            f'Upgrade your plan to add more.'
-                        ),
-                        'code': 'location_limit_reached',
-                    },
-                    status=status.HTTP_403_FORBIDDEN,
-                )
 
         serializer = LocationSerializer(data=request.data, context={'request': request})
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         serializer.save(organization=org)
+
+        # Sync overage quantity to Stripe for active paid subscribers.
+        # No-op for trial/free orgs — they have no subscription yet.
+        _sync_overage_quantity(org)
+
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class LocationDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def _get_location(self, request, pk):
         return get_object_or_404(Location, id=pk, organization=request.user.organization)
+
+    def get(self, request, pk):
+        location = self._get_location(request, pk)
+        return Response(LocationSerializer(location, context={'request': request}).data)
 
     def patch(self, request, pk):
         location = self._get_location(request, pk)
@@ -99,7 +98,7 @@ class LocationDetailView(APIView):
 
 class LocationPreviewView(APIView):
     """POST /api/dashboard/locations/<pk>/preview/ — mint a session for dashboard preview."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def post(self, request, pk):
         location = get_object_or_404(
@@ -124,13 +123,14 @@ class LocationPreviewView(APIView):
 # ── Surveys ───────────────────────────────────────────────────────────────────
 
 class SurveyListView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
         surveys = Survey.objects.filter(
             organization=request.user.organization
         ).prefetch_related('questions', 'incentives', 'locations').order_by('-created_at')
-        return Response(SurveySerializer(surveys, many=True).data)
+        data = SurveySerializer(surveys, many=True).data
+        return Response(list_response(data))
 
     def post(self, request):
         questions_data = request.data.pop('questions', [])
@@ -155,7 +155,7 @@ class SurveyListView(APIView):
 
 
 class SurveyDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def _get_survey(self, request, pk):
         return get_object_or_404(Survey, id=pk, organization=request.user.organization)
@@ -179,10 +179,15 @@ class SurveyDetailView(APIView):
 # ── Questions (nested under Survey) ──────────────────────────────────────────
 
 class QuestionListView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def _get_survey(self, request, survey_pk):
         return get_object_or_404(Survey, id=survey_pk, organization=request.user.organization)
+
+    def get(self, request, survey_pk):
+        survey = self._get_survey(request, survey_pk)
+        questions = survey.questions.order_by('position')
+        return Response(list_response(QuestionSerializer(questions, many=True).data))
 
     def post(self, request, survey_pk):
         survey = self._get_survey(request, survey_pk)
@@ -197,7 +202,7 @@ class QuestionListView(APIView):
 
 
 class QuestionDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def _get_question(self, request, survey_pk, pk):
         return get_object_or_404(
@@ -206,6 +211,10 @@ class QuestionDetailView(APIView):
             survey_id=survey_pk,
             organization=request.user.organization,
         )
+
+    def get(self, request, survey_pk, pk):
+        question = self._get_question(request, survey_pk, pk)
+        return Response(QuestionSerializer(question).data)
 
     def patch(self, request, survey_pk, pk):
         question = self._get_question(request, survey_pk, pk)
@@ -222,18 +231,18 @@ class QuestionDetailView(APIView):
 # ── Alerts ────────────────────────────────────────────────────────────────────
 
 class AlertListView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
         status_filter = request.query_params.get('status', 'pending')
         qs = Alert.objects.filter(
             location__organization=request.user.organization,
-            survey_response__is_test=False,   # test responses never generate alerts,
-                                               # but guard here for belt-and-suspenders
+            survey_response__is_test=False,
         ).select_related('location', 'survey_response').order_by('-created_at')
         if status_filter != 'all':
             qs = qs.filter(status=status_filter)
-        return Response([self._serialize(a) for a in qs[:50]])
+        data = [self._serialize(a) for a in qs[:50]]
+        return Response(list_response(data))
 
     @staticmethod
     def _serialize(alert):
@@ -250,7 +259,7 @@ class AlertListView(APIView):
 
 
 class AlertDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def patch(self, request, pk):
         alert = get_object_or_404(
@@ -280,7 +289,7 @@ def _get_org_tz(org):
 
 
 class InsightsView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
         org = request.user.organization
@@ -374,7 +383,7 @@ class InsightsView(APIView):
                 'avg_delta':           round(current_avg - previous_avg, 2) if previous_avg else None,
                 'total_responses':     current_agg['count'],
                 'count_delta':         current_agg['count'] - previous_agg['count'],
-                'test_response_count': test_response_count,  # frontend shows "N test responses excluded" when > 0
+                'test_response_count': test_response_count,
             },
             'daily_series': daily_series,
             'by_location': [
@@ -403,13 +412,11 @@ class InsightsView(APIView):
 # ── Comment Feed ──────────────────────────────────────────────────────────────
 
 class CommentFeedView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
         org = request.user.organization
 
-        # ?is_test=true shows test responses; default is real responses only.
-        # This lets owners verify their test submissions worked correctly.
         show_test = request.query_params.get('is_test', 'false').lower() == 'true'
 
         qs = (
@@ -441,12 +448,8 @@ class CommentFeedView(APIView):
         offset = (page - 1) * page_size
         items  = qs[offset:offset + page_size]
 
-        return Response({
-            'total':     total,
-            'page':      page,
-            'page_size': page_size,
-            'is_test':   show_test,
-            'results': [
+        return Response(list_response(
+            [
                 {
                     'id':            str(r.id),
                     'comment':       r.comment,
@@ -459,7 +462,12 @@ class CommentFeedView(APIView):
                 }
                 for r in items
             ],
-        })
+            # count here is the total across all pages, not just this page
+            count=total,
+            page=page,
+            page_size=page_size,
+            is_test=show_test,
+        ))
 
 
 # ── Organization ──────────────────────────────────────────────────────────────
@@ -470,25 +478,27 @@ _ORG_WRITABLE_FIELDS = {
     'default_alert_threshold', 'default_review_url',
     'default_comments_enabled', 'default_comments_prompt',
     'timezone',
-    'test_mode',   # owners toggle this from the settings page
+    'test_mode',
 }
 
 
 class OrganizationView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
-        from ..serializers import OrganizationSerializer
         return Response(OrganizationSerializer(request.user.organization).data)
 
     def patch(self, request):
         org = request.user.organization
+
         if not org:
             return Response({'detail': 'No organization found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        # if 'test_mode' in request.data and not request.user.is_staff:
+        #     return Response({'detail': 'Not permitted.'}, status=status.HTTP_403_FORBIDDEN)
+
         allowed = {k: v for k, v in request.data.items() if k in _ORG_WRITABLE_FIELDS}
 
-        from ..serializers import OrganizationSerializer
         serializer = OrganizationSerializer(org, data=allowed, partial=True)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -497,7 +507,7 @@ class OrganizationView(APIView):
 
 
 class QRCodeView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request, pk):
         location = get_object_or_404(Location, id=pk, organization=request.user.organization)
@@ -515,7 +525,7 @@ class QRCodeView(APIView):
             border=4,
         )
         frontend_url = os.environ.get('FRONTEND_URL', 'https://taprate.app')
-        qr.add_data(f"{frontend_url}/qr/{location.id}") 
+        qr.add_data(f"{frontend_url}/qr/{location.id}")
         qr.make(fit=True)
 
         img = qr.make_image(fill_color='black', back_color='white')

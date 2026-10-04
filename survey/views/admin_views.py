@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import Location, NfcTag, Organization, SurveyResponse
+from ..utils.responses import list_response
 
 User = get_user_model()
 
@@ -58,7 +59,7 @@ class AdminOrganizationListView(APIView):
             }
             for org in orgs
         ]
-        return Response(data)
+        return Response(list_response(data))
 
 
 class AdminTagListView(APIView):
@@ -89,12 +90,13 @@ class AdminTagListView(APIView):
             }
             for tag in tags
         ]
-        return Response(data)
+        return Response(list_response(data))
 
 
 class AdminRecentSignupsView(APIView):
     permission_classes = [IsAdminUser]
 
+    # Not converted — compound object with two named lists, not a single list endpoint.
     def get(self, request):
         recent_orgs = Organization.objects.order_by('-created_at')[:15]
         recent_users = (
@@ -175,11 +177,6 @@ class AdminOrgLocationsView(APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request, org_id):
-        """
-        All locations for this org, annotated with has_tag so the frontend can
-        distinguish between 'no locations exist' and 'all locations have tags'.
-        Only untagged locations are eligible targets for tag assignment.
-        """
         org = get_object_or_404(Organization, id=org_id)
         locations = (
             Location.objects
@@ -187,14 +184,15 @@ class AdminOrgLocationsView(APIView):
             .annotate(has_tag=Exists(NfcTag.objects.filter(location_id=OuterRef('pk'))))
             .order_by('name')
         )
-        return Response([
+        data = [
             {
                 'id':      str(loc.id),
                 'name':    loc.name,
                 'has_tag': loc.has_tag,
             }
             for loc in locations
-        ])
+        ]
+        return Response(list_response(data))
 
 
 class AdminOrgTagsView(APIView):
@@ -209,7 +207,7 @@ class AdminOrgTagsView(APIView):
             .select_related('location')
             .order_by('-claimed_at')
         )
-        return Response([
+        data = [
             {
                 'id':            str(tag.id),
                 'location_id':   str(tag.location.id) if tag.location else None,
@@ -218,7 +216,8 @@ class AdminOrgTagsView(APIView):
                 'created_at':    tag.created_at,
             }
             for tag in tags
-        ])
+        ]
+        return Response(list_response(data))
 
     def post(self, request, org_id):
         """
@@ -254,7 +253,6 @@ class AdminOrgTagsView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        # Check via queryset to avoid reverse-accessor exception on missing OneToOne
         if NfcTag.objects.filter(location=location).exists():
             return Response(
                 {'detail': 'This location already has a tag assigned.'},

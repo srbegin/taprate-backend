@@ -10,6 +10,7 @@ Required environment variables:
 import os
 import logging
 from celery import shared_task
+from django.core.management import call_command
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,234 @@ def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> boo
     except Exception as e:
         logger.error(f'Resend exception: {e}')
         return False
+
+
+# ── Welcome email ──────────────────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_welcome_email(self, user_id):
+    """
+    Fired immediately after a new account is created via RegisterView.
+    Sends a branded welcome email with quick-start steps.
+    """
+    from .models import User
+
+    try:
+        user = User.objects.select_related('organization').get(id=user_id)
+    except User.DoesNotExist:
+        logger.warning(f'send_welcome_email: User {user_id} not found')
+        return
+
+    first_name   = user.first_name or 'there'
+    org_name     = user.organization.name if user.organization else 'your organization'
+    frontend_url = os.environ.get('FRONTEND_URL', 'https://taprate.app')
+    dashboard_url = f"{frontend_url}/dashboard"
+
+    subject = f"Welcome to TapRate, {first_name}!"
+
+    text_body = (
+        f"Hi {first_name},\n\n"
+        f"Your TapRate account for {org_name} is ready.\n\n"
+        f"Here's how to get started:\n"
+        f"1. Create a location — a spot where you'll collect feedback\n"
+        f"2. Set up a survey — star ratings, comments, review redirects\n"
+        f"3. Claim your NFC tag or download a QR code\n"
+        f"4. Place it at your location and start collecting responses\n\n"
+        f"Head to your dashboard to get started:\n{dashboard_url}\n\n"
+        f"Questions? Reply to this email — we're happy to help.\n\n"
+        f"— The TapRate team"
+    )
+
+    html_body = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                max-width: 480px; margin: 0 auto; padding: 32px 24px; color: #111;">
+
+      <p style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+                color: #888; margin: 0 0 24px;">TapRate</p>
+
+      <h1 style="font-size: 24px; font-weight: 600; margin: 0 0 8px; color: #111;">
+        Welcome, {first_name}! 👋
+      </h1>
+      <p style="font-size: 15px; color: #555; margin: 0 0 28px; line-height: 1.6;">
+        Your TapRate account for <strong>{org_name}</strong> is ready.
+        Here's how to collect your first piece of feedback.
+      </p>
+
+      <!-- Steps -->
+      <div style="margin-bottom: 28px;">
+
+        <div style="display: flex; align-items: flex-start; margin-bottom: 16px;">
+          <div style="min-width: 28px; height: 28px; border-radius: 50%; background: #111;
+                      color: #fff; font-size: 12px; font-weight: 600; display: flex;
+                      align-items: center; justify-content: center; margin-right: 12px;
+                      margin-top: 1px; flex-shrink: 0; text-align: center; line-height: 28px;">
+            1
+          </div>
+          <div>
+            <p style="margin: 0 0 2px; font-size: 14px; font-weight: 600; color: #111;">Create a location</p>
+            <p style="margin: 0; font-size: 13px; color: #777;">A location is any physical spot where you want to collect feedback — a room, desk, or entry point.</p>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: flex-start; margin-bottom: 16px;">
+          <div style="min-width: 28px; height: 28px; border-radius: 50%; background: #111;
+                      color: #fff; font-size: 12px; font-weight: 600; display: flex;
+                      align-items: center; justify-content: center; margin-right: 12px;
+                      margin-top: 1px; flex-shrink: 0; text-align: center; line-height: 28px;">
+            2
+          </div>
+          <div>
+            <p style="margin: 0 0 2px; font-size: 14px; font-weight: 600; color: #111;">Set up a survey</p>
+            <p style="margin: 0; font-size: 13px; color: #777;">Choose a rating scale, enable comments, and optionally redirect happy customers to leave a public review.</p>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: flex-start; margin-bottom: 16px;">
+          <div style="min-width: 28px; height: 28px; border-radius: 50%; background: #111;
+                      color: #fff; font-size: 12px; font-weight: 600; display: flex;
+                      align-items: center; justify-content: center; margin-right: 12px;
+                      margin-top: 1px; flex-shrink: 0; text-align: center; line-height: 28px;">
+            3
+          </div>
+          <div>
+            <p style="margin: 0 0 2px; font-size: 14px; font-weight: 600; color: #111;">Claim your NFC tag or download a QR code</p>
+            <p style="margin: 0; font-size: 13px; color: #777;">Tap the tag with your phone to claim it, or download a print-ready QR code from your location settings.</p>
+          </div>
+        </div>
+
+        <div style="display: flex; align-items: flex-start;">
+          <div style="min-width: 28px; height: 28px; border-radius: 50%; background: #7c3aed;
+                      color: #fff; font-size: 12px; font-weight: 600; display: flex;
+                      align-items: center; justify-content: center; margin-right: 12px;
+                      margin-top: 1px; flex-shrink: 0; text-align: center; line-height: 28px;">
+            4
+          </div>
+          <div>
+            <p style="margin: 0 0 2px; font-size: 14px; font-weight: 600; color: #111;">Place it and go live</p>
+            <p style="margin: 0; font-size: 13px; color: #777;">Put the tag or QR code at your location. Responses and alerts start flowing into your dashboard immediately.</p>
+          </div>
+        </div>
+
+      </div>
+
+      <a href="{dashboard_url}"
+         style="display: inline-block; background: #7c3aed; color: #fff; text-decoration: none;
+                font-size: 13px; font-weight: 500; padding: 12px 24px; border-radius: 8px;">
+        Go to your dashboard →
+      </a>
+
+      <p style="font-size: 13px; color: #777; margin: 28px 0 0; line-height: 1.6;">
+        Questions? Just reply to this email — we read every one.
+      </p>
+
+      <p style="font-size: 12px; color: #bbb; margin: 24px 0 0;">
+        — The TapRate team
+      </p>
+    </div>
+    """
+
+    success = _send_email(
+        to=user.email,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+    if not success:
+        try:
+            raise self.retry()
+        except self.MaxRetriesExceededError:
+            logger.error(f'send_welcome_email: max retries exceeded for user {user_id}')
+
+
+# ── Password reset email ───────────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_password_reset_email(self, user_id, reset_url):
+    """
+    Fired by PasswordResetRequestView after generating a signed reset token.
+    The reset_url contains the uid + token and is valid for PASSWORD_RESET_TIMEOUT
+    seconds (Django default: 3 days). The token is single-use — it's invalidated
+    the moment the password is changed.
+    """
+    from .models import User
+
+    try:
+        user = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        logger.warning(f'send_password_reset_email: User {user_id} not found')
+        return
+
+    first_name = user.first_name or 'there'
+    subject    = 'Reset your TapRate password'
+
+    text_body = (
+        f"Hi {first_name},\n\n"
+        f"We received a request to reset the password for your TapRate account.\n\n"
+        f"Click the link below to set a new password. This link expires in 3 days "
+        f"and can only be used once.\n\n"
+        f"{reset_url}\n\n"
+        f"If you didn't request this, you can safely ignore this email — "
+        f"your password won't be changed.\n\n"
+        f"— The TapRate team"
+    )
+
+    html_body = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                max-width: 480px; margin: 0 auto; padding: 32px 24px; color: #111;">
+
+      <p style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+                color: #888; margin: 0 0 24px;">TapRate</p>
+
+      <h1 style="font-size: 22px; font-weight: 600; margin: 0 0 8px; color: #111;">
+        Reset your password
+      </h1>
+      <p style="font-size: 15px; color: #555; margin: 0 0 24px; line-height: 1.6;">
+        Hi {first_name} — we received a request to reset the password on your TapRate account.
+        Click the button below to choose a new one.
+      </p>
+
+      <a href="{reset_url}"
+         style="display: inline-block; background: #7c3aed; color: #fff; text-decoration: none;
+                font-size: 13px; font-weight: 500; padding: 12px 24px; border-radius: 8px;
+                margin-bottom: 24px;">
+        Reset my password →
+      </a>
+
+      <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px;
+                  padding: 14px 16px; margin-bottom: 24px;">
+        <p style="margin: 0; font-size: 12px; color: #888; line-height: 1.6;">
+          This link expires in <strong style="color: #555;">3 days</strong> and can only be used once.
+          If the button doesn't work, copy and paste this URL into your browser:
+        </p>
+        <p style="margin: 8px 0 0; font-size: 11px; color: #aaa; word-break: break-all;">
+          {reset_url}
+        </p>
+      </div>
+
+      <p style="font-size: 13px; color: #999; margin: 0; line-height: 1.6;">
+        If you didn't request a password reset, you can safely ignore this email.
+        Your password will not be changed.
+      </p>
+
+      <p style="font-size: 12px; color: #bbb; margin: 24px 0 0;">
+        — The TapRate team
+      </p>
+    </div>
+    """
+
+    success = _send_email(
+        to=user.email,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+    if not success:
+        try:
+            raise self.retry()
+        except self.MaxRetriesExceededError:
+            logger.error(f'send_password_reset_email: max retries exceeded for user {user_id}')
 
 
 # ── Alert email ────────────────────────────────────────────────────────────────
@@ -306,3 +535,8 @@ def send_incentive_email(self, survey_response_id):
             raise self.retry()
         except self.MaxRetriesExceededError:
             logger.error(f'send_incentive_email: max retries exceeded for {survey_response_id}')
+
+@shared_task
+def cleanup_expired_tokens():
+    """Flush expired entries from the simplejwt token_blacklist table."""
+    call_command('flushexpiredtokens')

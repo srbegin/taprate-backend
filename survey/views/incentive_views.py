@@ -4,15 +4,17 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
+from ..permissions import HasActiveAccess
 from ..models import Incentive, IncentiveWin, Survey
 from ..serializers import IncentiveSerializer, IncentiveWinSerializer, RedeemSerializer
+from ..utils.responses import list_response
 
 
 # ── Incentive CRUD ─────────────────────────────────────────────────────────────
 
 class IncentiveListCreateView(generics.ListCreateAPIView):
     serializer_class   = IncentiveSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get_queryset(self):
         return Incentive.objects.filter(
@@ -22,10 +24,16 @@ class IncentiveListCreateView(generics.ListCreateAPIView):
     def perform_create(self, serializer):
         serializer.save(organization=self.request.user.organization)
 
+    def list(self, request, *args, **kwargs):
+        """Override to return {items, meta} instead of DRF's bare array."""
+        queryset = self.get_queryset()
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(list_response(serializer.data))
+
 
 class IncentiveDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class   = IncentiveSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get_queryset(self):
         return Incentive.objects.filter(organization=self.request.user.organization)
@@ -41,7 +49,7 @@ class IncentiveAssignView(APIView):
     Enforces single active incentive per survey by detaching any
     previously assigned incentive on the target survey.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def patch(self, request, pk):
         try:
@@ -80,7 +88,7 @@ class IncentiveAssignView(APIView):
 # ── Redeem ─────────────────────────────────────────────────────────────────────
 
 class RedeemValidateView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def post(self, request):
         serializer = RedeemSerializer(data=request.data)
@@ -109,7 +117,7 @@ class RedeemValidateView(APIView):
 
 
 class RedeemUseView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def post(self, request, code):
         code = code.upper().strip()

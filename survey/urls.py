@@ -1,6 +1,7 @@
 from django.urls import path
 from .views import (
-    RegisterView, LoginView, MeView, TokenRefreshView, ChangePasswordView,
+    RegisterView, LoginView, LogoutView, MeView, TokenRefreshView, ChangePasswordView,
+    PasswordResetRequestView, PasswordResetConfirmView,
     LocationListView, LocationDetailView, LocationPreviewView,
     SurveyListView, SurveyDetailView,
     QuestionListView, QuestionDetailView,
@@ -14,59 +15,86 @@ from .views import (
     CheckoutView, PortalView, WebhookView,
     IncentiveListCreateView, IncentiveDetailView, IncentiveAssignView,
     RedeemValidateView, RedeemUseView,
+    ContactSubmissionView,
+    DemoSessionView,
+    AdminContactListView,
+    AdminContactDetailView,
 )
 
 urlpatterns = [
     # Auth
-    path('auth/register/', RegisterView.as_view()),
-    path('auth/login/', LoginView.as_view()),
-    path('auth/token/refresh/', TokenRefreshView.as_view()),
-    path('auth/me/', MeView.as_view()),
-    path('auth/change-password/', ChangePasswordView.as_view()),
+    path('auth/register/',                  RegisterView.as_view()),
+    path('auth/login/',                     LoginView.as_view()),
+    path('auth/logout/',                    LogoutView.as_view()),
+    path('auth/token/refresh/',             TokenRefreshView.as_view()),
+    path('auth/me/',                        MeView.as_view()),
+    path('auth/change-password/',           ChangePasswordView.as_view()),
+    path('auth/password-reset/',            PasswordResetRequestView.as_view()),
+    path('auth/password-reset/confirm/',    PasswordResetConfirmView.as_view()),
+
     # Dashboard — locations
-    path('dashboard/locations/', LocationListView.as_view()),
-    path('dashboard/locations/<uuid:pk>/', LocationDetailView.as_view()),
-    path('dashboard/locations/<uuid:pk>/qr/', QRCodeView.as_view()),
-    path('dashboard/locations/<uuid:pk>/preview/', LocationPreviewView.as_view()),
+    path('dashboard/locations/',                        LocationListView.as_view()),
+    path('dashboard/locations/<uuid:pk>/',              LocationDetailView.as_view()),
+    path('dashboard/locations/<uuid:pk>/qr/',           QRCodeView.as_view()),
+    path('dashboard/locations/<uuid:pk>/preview/',      LocationPreviewView.as_view()),
+
     # Dashboard — surveys
-    path('dashboard/surveys/', SurveyListView.as_view()),
-    path('dashboard/surveys/<uuid:pk>/', SurveyDetailView.as_view()),
+    path('dashboard/surveys/',              SurveyListView.as_view()),
+    path('dashboard/surveys/<uuid:pk>/',    SurveyDetailView.as_view()),
+
     # Dashboard — questions (nested under survey)
-    path('dashboard/surveys/<uuid:survey_pk>/questions/', QuestionListView.as_view()),
+    path('dashboard/surveys/<uuid:survey_pk>/questions/',           QuestionListView.as_view()),
     path('dashboard/surveys/<uuid:survey_pk>/questions/<uuid:pk>/', QuestionDetailView.as_view()),
+
     # Dashboard — alerts
-    path('dashboard/alerts/', AlertListView.as_view()),
+    path('dashboard/alerts/',           AlertListView.as_view()),
     path('dashboard/alerts/<uuid:pk>/', AlertDetailView.as_view()),
+
     # Dashboard — insights
     path('dashboard/insights/', InsightsView.as_view()),
+
     # Dashboard — comments
     path('dashboard/comments/', CommentFeedView.as_view()),
+
     # Dashboard — organization
     path('dashboard/organization/', OrganizationView.as_view()),
+
     # Incentives
-    path('dashboard/incentives/', IncentiveListCreateView.as_view()),
-    path('dashboard/incentives/<uuid:pk>/', IncentiveDetailView.as_view()),
-    path('dashboard/incentives/<uuid:pk>/assign/', IncentiveAssignView.as_view()),
-    path('dashboard/redeem/', RedeemValidateView.as_view()),
-    path('dashboard/redeem/<str:code>/use/', RedeemUseView.as_view()),
+    path('dashboard/incentives/',                       IncentiveListCreateView.as_view()),
+    path('dashboard/incentives/<uuid:pk>/',             IncentiveDetailView.as_view()),
+    path('dashboard/incentives/<uuid:pk>/assign/',      IncentiveAssignView.as_view()),
+    path('dashboard/redeem/',                           RedeemValidateView.as_view()),
+    path('dashboard/redeem/<str:code>/use/',            RedeemUseView.as_view()),
+
     # Public survey PWA — session_token is a UUID string minted by TagSessionView
-    path('survey/<str:session_token>/', PublicSurveyDetailView.as_view()),
-    path('survey/<str:session_token>/response/', SurveyResponseView.as_view()),
+    path('survey/<str:session_token>/',             PublicSurveyDetailView.as_view()),
+    path('survey/<str:session_token>/response/',    SurveyResponseView.as_view()),
     path('survey/location/<uuid:location_id>/session/', QrSessionView.as_view()),
+
     # NFC tag claim + session mint
-    path('tags/<uuid:tag_id>/', NfcTagView.as_view()),
-    path('tags/<uuid:tag_id>/session/', TagSessionView.as_view()),
+    path('tags/<uuid:tag_id>/',             NfcTagView.as_view()),
+    path('tags/<uuid:tag_id>/session/',     TagSessionView.as_view()),
+
+    # Contact form (public)
+    path('contact/', ContactSubmissionView.as_view()),
+
+    # Demo session (public)
+    path('demo/session/', DemoSessionView.as_view()),
+
     # Admin
-    path('admin/overview/', AdminOverviewView.as_view()),
-    path('admin/organizations/', AdminOrganizationListView.as_view()),
-    path('admin/tags/', AdminTagListView.as_view()),
-    path('admin/signups/', AdminRecentSignupsView.as_view()),
-    path('admin/tags/<uuid:tag_id>/release/', AdminTagDetailView.as_view()),
-    path('admin/orgs/<uuid:org_id>/',            AdminOrgDetailView.as_view()),
-    path('admin/orgs/<uuid:org_id>/tags/',       AdminOrgTagsView.as_view()),
-    path('admin/orgs/<uuid:org_id>/locations/', AdminOrgLocationsView.as_view()),
+    path('admin/overview/',                         AdminOverviewView.as_view()),
+    path('admin/organizations/',                    AdminOrganizationListView.as_view()),
+    path('admin/tags/',                             AdminTagListView.as_view()),
+    path('admin/signups/',                          AdminRecentSignupsView.as_view()),
+    path('admin/tags/<uuid:tag_id>/release/',       AdminTagDetailView.as_view()),
+    path('admin/orgs/<uuid:org_id>/',               AdminOrgDetailView.as_view()),
+    path('admin/orgs/<uuid:org_id>/tags/',          AdminOrgTagsView.as_view()),
+    path('admin/orgs/<uuid:org_id>/locations/',     AdminOrgLocationsView.as_view()),
+    path('admin/contacts/',                         AdminContactListView.as_view()),
+    path('admin/contacts/<uuid:pk>/',               AdminContactDetailView.as_view()),
+
     # Billing
     path('billing/checkout/', CheckoutView.as_view()),
-    path('billing/portal/', PortalView.as_view()),
-    path('billing/webhook/', WebhookView.as_view()),
+    path('billing/portal/',   PortalView.as_view()),
+    path('billing/webhook/',  WebhookView.as_view()),
 ]

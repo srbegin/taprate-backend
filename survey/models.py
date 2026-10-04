@@ -67,6 +67,7 @@ class Organization(models.Model):
                                  ),
                              )
     created_at             = models.DateTimeField(auto_now_add=True)
+    is_test = models.BooleanField(default=False)
 
     def __str__(self):
         return self.name
@@ -78,6 +79,7 @@ class Organization(models.Model):
             return True
         return False
 
+    @property
     def trial_days_remaining(self):
         if not self.trial_ends_at:
             return 0
@@ -370,3 +372,32 @@ class Alert(models.Model):
 
     def __str__(self):
         return f"Alert {self.id} — {self.rating}★"
+
+class ContactSubmission(models.Model):
+    STATUS_CHOICES = [
+        ('new',       'New'),
+        ('contacted', 'Contacted'),
+        ('converted', 'Converted'),
+        ('declined',  'Declined'),
+        ('spam',      'Spam'),
+    ]
+ 
+    id             = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name           = models.CharField(max_length=120)
+    business_name  = models.CharField(max_length=200)
+    email          = models.EmailField()
+    phone          = models.CharField(max_length=40, blank=True)
+    location_count = models.CharField(max_length=10)   # '1' | '2-5' | '6-20' | '20+'
+    message        = models.TextField(blank=True)
+    status         = models.CharField(max_length=20, choices=STATUS_CHOICES, default='new')
+    notes          = models.TextField(blank=True)       # internal admin notes
+    submitted_at   = models.DateTimeField(auto_now_add=True)
+    contacted_at   = models.DateTimeField(null=True, blank=True)
+    ip_address     = models.GenericIPAddressField(null=True, blank=True)
+ 
+    class Meta:
+        ordering = ['-submitted_at']
+ 
+    def __str__(self):
+        return f'{self.business_name} — {self.email} [{self.status}]'
+ 

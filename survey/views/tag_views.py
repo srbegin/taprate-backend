@@ -9,6 +9,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.core.cache import cache
 
+from ..permissions import HasActiveAccess
 from ..models import NfcTag, Location
 
 # Session token TTL in seconds (30 minutes)
@@ -33,7 +34,7 @@ class NfcTagView(APIView):
     def get_permissions(self):
         if self.request.method == 'GET':
             return [AllowAny()]
-        return [IsAuthenticated()]
+        return [IsAuthenticated(), HasActiveAccess()]
 
     def get(self, request, tag_id):
         """Public — check if tag is claimed."""

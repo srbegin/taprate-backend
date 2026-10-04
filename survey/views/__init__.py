@@ -1,5 +1,5 @@
 from .tag_views import NfcTagView, TagSessionView
-from .auth_views import RegisterView, LoginView, MeView, TokenRefreshView, ChangePasswordView
+from .auth_views import RegisterView, LoginView, LogoutView, MeView, TokenRefreshView, ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView
 from .admin_views import (
     AdminOverviewView,
     AdminOrganizationListView,
@@ -23,5 +23,13 @@ from .incentive_views import (
     RedeemValidateView,
     RedeemUseView,
 )
+
+from .contact_views import (
+    ContactSubmissionView,
+    DemoSessionView,
+    AdminContactListView,
+    AdminContactDetailView,
+)
+
 from .billing_views import CheckoutView, PortalView, WebhookView
 from .survey_views import PublicSurveyDetailView, SurveyResponseView, QrSessionView

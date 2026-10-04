@@ -12,18 +12,21 @@ stripe.api_key = os.environ.get('STRIPE_SECRET_KEY')
 PRICE_IDS = {
     'starter': os.environ.get('STRIPE_PRICE_STARTER'),
     'growth':  os.environ.get('STRIPE_PRICE_GROWTH'),
-    'pro':     os.environ.get('STRIPE_PRICE_PRO'),
 }
 
-# ── Location limits per plan ───────────────────────────────────────────────────
-# This is the single source of truth for per-plan location caps.
-# None means unlimited. Import this in dashboard_views.py for the create guard.
-PLAN_LOCATION_LIMITS = {
-    'free':    1,
+# ── Plan base location allocations ────────────────────────────────────────────
+# Single source of truth for included locations per plan.
+# Trial/free orgs have no cap — access is gated by trial_ends_at only.
+# Import this in dashboard_views.py for the location list meta.
+PLAN_BASE_LOCATIONS = {
     'starter': 3,
     'growth':  10,
-    'pro':     None,  # unlimited
 }
+
+# ── Overage pricing ───────────────────────────────────────────────────────────
+# Flat per-location monthly charge beyond the plan's base allocation.
+OVERAGE_PRICE_PER_LOCATION = 10
+OVERAGE_PRICE_ID = os.environ.get('STRIPE_PRICE_OVERAGE')  # $10/location Stripe price
 
 
 def _get_or_create_customer(org, user):
@@ -38,6 +41,68 @@ def _get_or_create_customer(org, user):
     org.stripe_customer_id = customer.id
     org.save(update_fields=['stripe_customer_id'])
     return customer.id
+
+
+def _sync_overage_quantity(org):
+    """
+    Update the overage line item quantity on the org's active Stripe subscription.
+
+    Called after a location is created or deleted for paid subscribers.
+    For trial/free orgs this is a no-op — they have no Stripe subscription yet.
+
+    Overage = max(0, location_count - base_allocation).
+    If overage is 0 the line item quantity is set to 0 (Stripe keeps the item
+    but bills nothing), which avoids having to add/remove the item dynamically.
+    """
+    if not org.stripe_subscription_id or org.subscription_status != 'active':
+        return
+
+    base = PLAN_BASE_LOCATIONS.get(org.plan)
+    if base is None:
+        # Unknown plan — don't touch the subscription
+        return
+
+    from ..models import Location
+    location_count = Location.objects.filter(organization=org).count()
+    overage = max(0, location_count - base)
+
+    if not OVERAGE_PRICE_ID:
+        # Overage price not configured — skip silently (dev/staging env)
+        return
+
+    try:
+        subscription = stripe.Subscription.retrieve(
+            org.stripe_subscription_id,
+            expand=['items'],
+        )
+
+        # Find existing overage item if any
+        overage_item = next(
+            (item for item in subscription['items']['data']
+             if item['price']['id'] == OVERAGE_PRICE_ID),
+            None,
+        )
+
+        if overage_item:
+            if overage_item['quantity'] != overage:
+                stripe.SubscriptionItem.modify(
+                    overage_item['id'],
+                    quantity=overage,
+                    proration_behavior='always_invoice',
+                )
+        elif overage > 0:
+            # Add the overage line item for the first time
+            stripe.SubscriptionItem.create(
+                subscription=org.stripe_subscription_id,
+                price=OVERAGE_PRICE_ID,
+                quantity=overage,
+                proration_behavior='always_invoice',
+            )
+        # If overage == 0 and no item exists, nothing to do
+
+    except stripe.error.StripeError:
+        # Non-fatal — billing will reconcile on next cycle
+        pass
 
 
 class CheckoutView(APIView):
@@ -58,7 +123,7 @@ class CheckoutView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        org  = request.user.organization
+        org = request.user.organization
         frontend_url = os.environ.get('FRONTEND_URL', 'https://taprate.app')
 
         try:
@@ -181,11 +246,13 @@ class WebhookView(APIView):
         }
         org.subscription_status = status_map.get(stripe_status, stripe_status)
 
+        # Derive plan from the base price ID only (ignore overage item)
         items = subscription.get('items', {}).get('data', [])
-        if items:
-            price_id = items[0].get('price', {}).get('id')
-            reverse  = {v: k for k, v in PRICE_IDS.items()}
+        reverse = {v: k for k, v in PRICE_IDS.items()}
+        for item in items:
+            price_id = item.get('price', {}).get('id')
             if price_id in reverse:
                 org.plan = reverse[price_id]
+                break
 
         org.save(update_fields=['subscription_status', 'plan'])

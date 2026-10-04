@@ -12,7 +12,7 @@ primary_region = "ewr"  # Newark — closest to Narragansett RI
 
 [processes]
   app = "gunicorn core.wsgi:application --bind 0.0.0.0:8000 --workers 1 --timeout 60 --access-logfile -"
-  worker = "celery -A core worker --loglevel=info"
+  worker = "celery -A core worker -B --loglevel=info"
 
 [[services]]
   protocol = "tcp"
