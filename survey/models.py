@@ -3,31 +3,33 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
 
+from .products import PRODUCT_CHOICES, TAPRATE
+
+
+SUBSCRIPTION_STATUS_CHOICES = [
+    ('trialing',         'Trialing'),
+    ('active',           'Active'),
+    ('past_due',         'Past Due'),
+    ('canceled',         'Canceled'),
+    ('unpaid',           'Unpaid'),
+]
+
+
+def _product_field(**kwargs):
+    """Which product (Cleanpulse / TapRate) a record belongs to."""
+    kwargs.setdefault('default', TAPRATE)
+    return models.CharField(max_length=20, choices=PRODUCT_CHOICES, db_index=True, **kwargs)
+
 
 class Organization(models.Model):
-    SUBSCRIPTION_STATUS_CHOICES = [
-        ('trialing',         'Trialing'),
-        ('active',           'Active'),
-        ('past_due',         'Past Due'),
-        ('canceled',         'Canceled'),
-        ('unpaid',           'Unpaid'),
-    ]
-
     id                     = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name                   = models.CharField(max_length=200)
     slug                   = models.SlugField(unique=True)
     brand_color            = models.CharField(max_length=7, default='#0c0c0e')
     logo_url               = models.URLField(blank=True)
-    plan                   = models.CharField(max_length=20, default='free')
     # ── Billing ──────────────────────────────────────────────────────────────
+    # One Stripe customer per org; per-product plan/status live on Subscription.
     stripe_customer_id     = models.CharField(max_length=100, blank=True)
-    stripe_subscription_id = models.CharField(max_length=100, blank=True)
-    subscription_status    = models.CharField(
-                                 max_length=20,
-                                 choices=SUBSCRIPTION_STATUS_CHOICES,
-                                 blank=True,
-                             )
-    trial_ends_at          = models.DateTimeField(null=True, blank=True)
     # ── Notifications ─────────────────────────────────────────────────────────
     alert_email            = models.EmailField(
                                  blank=True,
@@ -72,8 +74,47 @@ class Organization(models.Model):
     def __str__(self):
         return self.name
 
+    def get_subscription(self, product):
+        return self.subscriptions.filter(product=product).first()
+
+    def has_access(self, product):
+        sub = self.get_subscription(product)
+        return bool(sub and sub.is_access_allowed())
+
+
+class Subscription(models.Model):
+    """
+    An organization's subscription to one product. Cleanpulse and TapRate are
+    bought separately, so an org has at most one row per product. All billing
+    state lives here; the Stripe customer stays on Organization (one customer,
+    up to two Stripe subscriptions).
+    """
+    id                     = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization           = models.ForeignKey(
+                                 Organization, on_delete=models.CASCADE, related_name='subscriptions'
+                             )
+    product                = models.CharField(max_length=20, choices=PRODUCT_CHOICES)
+    # '' while trialing. Never 'free' — plan names must match billing PRICE_IDS.
+    plan                   = models.CharField(max_length=20, blank=True)
+    status                 = models.CharField(
+                                 max_length=20, choices=SUBSCRIPTION_STATUS_CHOICES, blank=True
+                             )
+    stripe_subscription_id = models.CharField(max_length=100, blank=True, db_index=True)
+    trial_ends_at          = models.DateTimeField(null=True, blank=True)
+    created_at             = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'product'], name='unique_subscription_per_product'
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.organization.name} — {self.product} ({self.status or 'none'})"
+
     def is_access_allowed(self):
-        if self.subscription_status == 'active':
+        if self.status == 'active':
             return True
         if self.trial_ends_at and timezone.now() < self.trial_ends_at:
             return True
@@ -122,6 +163,7 @@ class Survey(models.Model):
         Organization, null=True, blank=True,
         on_delete=models.CASCADE, related_name='surveys'
     )
+    product = _product_field()
     name = models.CharField(max_length=200)
     comments_enabled = models.BooleanField(default=False)
     comments_prompt = models.CharField(
@@ -200,6 +242,7 @@ class Incentive(models.Model):
     organization = models.ForeignKey(
         Organization, on_delete=models.CASCADE, related_name='incentives'
     )
+    product = _product_field()
     survey = models.ForeignKey(
         # SET_NULL: detach from survey rather than delete.
         Survey, null=True, blank=True,
@@ -253,6 +296,8 @@ class NfcTag(models.Model):
                        'Location', null=True, blank=True,
                        on_delete=models.SET_NULL, related_name='nfc_tag'
                    )
+    # '' = unallocated stock. Set when allocated/claimed; must match its location's product.
+    product      = _product_field(default='', blank=True)
     claimed_at   = models.DateTimeField(null=True, blank=True)
     created_at   = models.DateTimeField(auto_now_add=True)
 
@@ -271,22 +316,15 @@ class Location(models.Model):
         Survey, null=True, blank=True,
         on_delete=models.SET_NULL, related_name='locations'
     )
+    product = _product_field()
     name = models.CharField(max_length=200)
     floor = models.CharField(max_length=100, blank=True)
     active = models.BooleanField(default=True)
     qr_enabled = models.BooleanField(default=False)
-    nfc_url = models.CharField(max_length=500, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         indexes = [models.Index(fields=['active'])]
-
-    def save(self, *args, **kwargs):
-        if not self.nfc_url:
-            import os
-            base = os.environ.get('FRONTEND_URL', 'https://taprate.app')
-            self.nfc_url = f"{base}/s/{self.id}"
-        super().save(*args, **kwargs)
 
     def __str__(self):
         org = self.organization.name if self.organization else 'No Org'
@@ -383,6 +421,7 @@ class ContactSubmission(models.Model):
     ]
  
     id             = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    product        = _product_field()   # which brand's site the lead came from
     name           = models.CharField(max_length=120)
     business_name  = models.CharField(max_length=200)
     email          = models.EmailField()

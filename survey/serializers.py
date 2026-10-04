@@ -1,11 +1,11 @@
 import uuid
-import os
-from datetime import timedelta
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import URLValidator
 from django.utils.text import slugify
-from django.utils import timezone
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from .models import Organization, Incentive, IncentiveWin, Survey, Question, SurveyResponse, Location
+from .products import DEFAULT_PRODUCT, get_brand, get_product as request_product
 
 User = get_user_model()
 
@@ -35,7 +35,7 @@ class IncentiveSerializer(serializers.ModelSerializer):
         if value is None:
             return value
         request = self.context.get('request')
-        if value.organization != request.user.organization:
+        if value.organization != request.user.organization or value.product != request_product(request):
             raise serializers.ValidationError('Survey not found.')
         return value
 
@@ -213,9 +213,19 @@ class SurveyResponseSubmitSerializer(serializers.Serializer):
 # ── Auth / User ───────────────────────────────────────────────────────────────
 
 class OrganizationSerializer(serializers.ModelSerializer):
-    trial_days_remaining = serializers.IntegerField(read_only=True)
+    """
+    Billing fields describe the product this request is for (X-Product header,
+    default TapRate). They keep their pre-split keys so existing frontends work
+    unchanged; `subscriptions` lists every product the org has.
+    """
+    product              = serializers.SerializerMethodField()
+    plan                 = serializers.SerializerMethodField()
+    subscription_status  = serializers.SerializerMethodField()
+    trial_ends_at        = serializers.SerializerMethodField()
+    trial_days_remaining = serializers.SerializerMethodField()
     location_count       = serializers.SerializerMethodField()
-    overage_count        = serializers.SerializerMethodField()  
+    overage_count        = serializers.SerializerMethodField()
+    subscriptions        = serializers.SerializerMethodField()
 
     class Meta:
         model = Organization
@@ -224,10 +234,12 @@ class OrganizationSerializer(serializers.ModelSerializer):
             'id', 'name', 'slug',
             # branding
             'brand_color', 'logo_url',
-            # billing (read-only)
+            # billing (read-only, for the request's product)
+            'product',
             'plan', 'subscription_status', 'trial_ends_at', 'trial_days_remaining',
             'location_count',
-            'overage_count',  
+            'overage_count',
+            'subscriptions',
             # notifications
             'alert_email', 'alerts_enabled',
             # survey defaults
@@ -236,21 +248,65 @@ class OrganizationSerializer(serializers.ModelSerializer):
             'timezone',
             'test_mode',
         ]
-        read_only_fields = [
-            'id', 'slug', 'plan', 'subscription_status',
-            'trial_ends_at', 'location_count',
-        ]
+        read_only_fields = ['id', 'slug']
+
+    def _product(self):
+        request = self.context.get('request')
+        return request_product(request) if request else DEFAULT_PRODUCT
+
+    def _subscription(self, obj):
+        return obj.get_subscription(self._product())
+
+    def _usage(self, obj):
+        from .views.billing_views import location_usage
+        if not hasattr(self, '_usage_cache'):
+            self._usage_cache = {}
+        key = (obj.pk, self._product())
+        if key not in self._usage_cache:
+            self._usage_cache[key] = location_usage(obj, self._product())
+        return self._usage_cache[key]
+
+    def get_product(self, obj):
+        return self._product()
+
+    def get_plan(self, obj):
+        sub = self._subscription(obj)
+        # Legacy display value: trials report 'free' as before the split.
+        # Limit logic never reads this — it uses Subscription.plan.
+        return (sub.plan if sub else '') or 'free'
+
+    def get_subscription_status(self, obj):
+        sub = self._subscription(obj)
+        return sub.status if sub else ''
+
+    def get_trial_ends_at(self, obj):
+        sub = self._subscription(obj)
+        if not sub or not sub.trial_ends_at:
+            return None
+        return serializers.DateTimeField().to_representation(sub.trial_ends_at)
+
+    def get_trial_days_remaining(self, obj):
+        sub = self._subscription(obj)
+        return sub.trial_days_remaining if sub else 0
 
     def get_location_count(self, obj):
-        return obj.locations.count()
+        return self._usage(obj)[0]
 
-    def get_overage_count(self, obj):                            # ← ADD
-        from .views.billing_views import PLAN_BASE_LOCATIONS
-        base = PLAN_BASE_LOCATIONS.get(obj.plan)
-        if base is None:
-            return 0
-        count = obj.locations.count()
-        return max(0, count - base)
+    def get_overage_count(self, obj):
+        return self._usage(obj)[2]
+
+    def get_subscriptions(self, obj):
+        return [
+            {
+                'product':              sub.product,
+                'plan':                 sub.plan,
+                'status':               sub.status,
+                'trial_ends_at':        serializers.DateTimeField().to_representation(sub.trial_ends_at)
+                                        if sub.trial_ends_at else None,
+                'trial_days_remaining': sub.trial_days_remaining,
+            }
+            for sub in obj.subscriptions.order_by('product')
+        ]
 
     def validate_default_alert_threshold(self, value):
         if not (1 <= value <= 5):
@@ -292,7 +348,8 @@ class RegisterSerializer(serializers.Serializer):
         return value.lower()
 
     def create(self, validated_data):
-        trial_days = int(os.environ.get('TRIAL_DAYS', 30))
+        from .views.billing_views import start_trial
+        product = validated_data.pop('product', DEFAULT_PRODUCT)
 
         base_slug = slugify(validated_data['org_name'])
         slug = base_slug or f"org-{uuid.uuid4().hex[:6]}"
@@ -302,9 +359,8 @@ class RegisterSerializer(serializers.Serializer):
         org = Organization.objects.create(
             name=validated_data['org_name'],
             slug=slug,
-            trial_ends_at=timezone.now() + timedelta(days=trial_days),
-            subscription_status='trialing',
         )
+        start_trial(org, product)
         user = User.objects.create_user(
             username=validated_data['email'],
             email=validated_data['email'],
@@ -343,16 +399,14 @@ class LocationSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'nfc_url', 'created_at']
 
     def get_nfc_url(self, obj):
-        request = self.context.get('request')
-        frontend_base = os.environ.get('FRONTEND_URL', 'https://taprate.app')
-        if request:
-            frontend_base = request.META.get('HTTP_X_FRONTEND_URL', frontend_base)
-        return f"{frontend_base}/s/{obj.id}"
+        # Shareable public link for this location (key kept for frontend compat).
+        # Opens the QR entry route, which mints a survey session.
+        return f"{get_brand(obj.product).frontend_url}/qr/{obj.id}"
 
     def validate_survey(self, value):
         if value is None:
             return value
         request = self.context.get('request')
-        if value.organization != request.user.organization:
+        if value.organization != request.user.organization or value.product != request_product(request):
             raise serializers.ValidationError('Survey not found.')
         return value

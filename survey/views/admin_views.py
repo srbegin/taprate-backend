@@ -10,10 +10,35 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import Location, NfcTag, Organization, SurveyResponse
+from ..products import TAPRATE
 from ..utils.responses import list_response
 
 User = get_user_model()
 
+
+
+def _subscriptions(org):
+    """Per-product subscriptions for admin display."""
+    return [
+        {
+            'product':                sub.product,
+            'plan':                   sub.plan,
+            'status':                 sub.status,
+            'trial_ends_at':          sub.trial_ends_at,
+            'stripe_subscription_id': sub.stripe_subscription_id,
+        }
+        for sub in org.subscriptions.all()
+    ]
+
+
+def _legacy_sub(org):
+    """TapRate subscription, backing the pre-split plan/status keys the admin UI reads."""
+    return next((sub for sub in org.subscriptions.all() if sub.product == TAPRATE), None)
+
+
+def _legacy_plan(org):
+    sub = _legacy_sub(org)
+    return (sub.plan if sub else '') or 'free'
 
 class AdminOverviewView(APIView):
     permission_classes = [IsAdminUser]
@@ -44,6 +69,7 @@ class AdminOrganizationListView(APIView):
                 response_count=Count('locations__responses', distinct=True),
                 user_count=Count('members', distinct=True),
             )
+            .prefetch_related('subscriptions')
             .order_by('-created_at')
         )
         data = [
@@ -51,7 +77,8 @@ class AdminOrganizationListView(APIView):
                 'id':             str(org.id),
                 'name':           org.name,
                 'slug':           org.slug,
-                'plan':           org.plan,
+                'plan':           _legacy_plan(org),
+                'subscriptions':  _subscriptions(org),
                 'location_count': org.location_count,
                 'response_count': org.response_count,
                 'user_count':     org.user_count,
@@ -98,7 +125,7 @@ class AdminRecentSignupsView(APIView):
 
     # Not converted — compound object with two named lists, not a single list endpoint.
     def get(self, request):
-        recent_orgs = Organization.objects.order_by('-created_at')[:15]
+        recent_orgs = Organization.objects.prefetch_related('subscriptions').order_by('-created_at')[:15]
         recent_users = (
             User.objects
             .select_related('organization')
@@ -108,9 +135,10 @@ class AdminRecentSignupsView(APIView):
             'recent_orgs': [
                 {
                     'id':         str(org.id),
-                    'name':       org.name,
-                    'plan':       org.plan,
-                    'created_at': org.created_at,
+                    'name':          org.name,
+                    'plan':          _legacy_plan(org),
+                    'subscriptions': _subscriptions(org),
+                    'created_at':    org.created_at,
                 }
                 for org in recent_orgs
             ],
@@ -149,15 +177,17 @@ class AdminOrgDetailView(APIView):
     def get(self, request, org_id):
         """Full org record for the admin detail page."""
         org = get_object_or_404(Organization, id=org_id)
+        legacy = _legacy_sub(org)
         return Response({
             'id':                     str(org.id),
             'name':                   org.name,
             'slug':                   org.slug,
-            'plan':                   org.plan,
-            'subscription_status':    org.subscription_status,
-            'trial_ends_at':          org.trial_ends_at,
+            'plan':                   _legacy_plan(org),
+            'subscription_status':    legacy.status if legacy else '',
+            'trial_ends_at':          legacy.trial_ends_at if legacy else None,
             'stripe_customer_id':     org.stripe_customer_id,
-            'stripe_subscription_id': org.stripe_subscription_id,
+            'stripe_subscription_id': legacy.stripe_subscription_id if legacy else '',
+            'subscriptions':          _subscriptions(org),
             'alert_email':            org.alert_email,
             'alerts_enabled':         org.alerts_enabled,
             'timezone':               org.timezone,

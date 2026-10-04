@@ -1,5 +1,3 @@
-import os
-
 from django.contrib.auth import authenticate
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.utils.encoding import force_bytes, force_str
@@ -14,6 +12,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from ..serializers import RegisterSerializer, UserSerializer
+from ..products import get_brand, get_product
 
 
 # ── Throttle classes ───────────────────────────────────────────────────────────
@@ -49,14 +48,15 @@ class RegisterView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        user = serializer.save()
+        product = get_product(request)
+        user = serializer.save(product=product)
 
         from ..tasks import send_welcome_email
-        send_welcome_email.delay(str(user.id))
+        send_welcome_email.delay(str(user.id), product)
 
         return Response(
             {
-                'user': UserSerializer(user).data,
+                'user': UserSerializer(user, context={'request': request}).data,
                 'tokens': _token_pair(user),
             },
             status=status.HTTP_201_CREATED,
@@ -67,7 +67,7 @@ class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        return Response(UserSerializer(request.user).data)
+        return Response(UserSerializer(request.user, context={'request': request}).data)
 
 
 class LoginView(APIView):
@@ -86,7 +86,7 @@ class LoginView(APIView):
             )
 
         return Response({
-            'user': UserSerializer(user).data,
+            'user': UserSerializer(user, context={'request': request}).data,
             'tokens': _token_pair(user),
         })
 
@@ -187,9 +187,10 @@ class PasswordResetRequestView(APIView):
                 user      = User.objects.get(email=email)
                 uid       = urlsafe_base64_encode(force_bytes(user.pk))
                 token     = PasswordResetTokenGenerator().make_token(user)
-                frontend  = os.environ.get('FRONTEND_URL', 'https://taprate.app')
+                product   = get_product(request)
+                frontend  = get_brand(product).frontend_url
                 reset_url = f"{frontend}/auth/reset-password?uid={uid}&token={token}"
-                send_password_reset_email.delay(str(user.id), reset_url)
+                send_password_reset_email.delay(str(user.id), reset_url, product)
             except User.DoesNotExist:
                 pass  # Silent — never reveal whether the email exists
 

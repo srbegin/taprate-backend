@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
 from ..permissions import HasActiveAccess
+from ..products import get_product
 from ..models import Incentive, IncentiveWin, Survey
 from ..serializers import IncentiveSerializer, IncentiveWinSerializer, RedeemSerializer
 from ..utils.responses import list_response
@@ -18,11 +19,15 @@ class IncentiveListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         return Incentive.objects.filter(
-            organization=self.request.user.organization
+            organization=self.request.user.organization,
+            product=get_product(self.request),
         ).select_related('survey').order_by('-created_at')
 
     def perform_create(self, serializer):
-        serializer.save(organization=self.request.user.organization)
+        serializer.save(
+            organization=self.request.user.organization,
+            product=get_product(self.request),
+        )
 
     def list(self, request, *args, **kwargs):
         """Override to return {items, meta} instead of DRF's bare array."""
@@ -36,7 +41,10 @@ class IncentiveDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get_queryset(self):
-        return Incentive.objects.filter(organization=self.request.user.organization)
+        return Incentive.objects.filter(
+            organization=self.request.user.organization,
+            product=get_product(self.request),
+        )
 
 
 class IncentiveAssignView(APIView):
@@ -54,7 +62,7 @@ class IncentiveAssignView(APIView):
     def patch(self, request, pk):
         try:
             incentive = Incentive.objects.get(
-                id=pk, organization=request.user.organization
+                id=pk, organization=request.user.organization, product=get_product(request),
             )
         except Incentive.DoesNotExist:
             return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -68,7 +76,7 @@ class IncentiveAssignView(APIView):
 
         try:
             survey = Survey.objects.get(
-                id=survey_id, organization=request.user.organization
+                id=survey_id, organization=request.user.organization, product=incentive.product,
             )
         except Survey.DoesNotExist:
             return Response({'detail': 'Survey not found.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -103,6 +111,7 @@ class RedeemValidateView(APIView):
             ).get(
                 code=code,
                 incentive__organization=request.user.organization,
+                incentive__product=get_product(request),
             )
         except IncentiveWin.DoesNotExist:
             return Response(
@@ -128,6 +137,7 @@ class RedeemUseView(APIView):
             ).get(
                 code=code,
                 incentive__organization=request.user.organization,
+                incentive__product=get_product(request),
             )
         except IncentiveWin.DoesNotExist:
             return Response(

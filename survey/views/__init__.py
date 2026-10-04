@@ -31,5 +31,5 @@ from .contact_views import (
     AdminContactDetailView,
 )
 
-from .billing_views import CheckoutView, PortalView, WebhookView
+from .billing_views import CheckoutView, PortalView, StartTrialView, WebhookView
 from .survey_views import PublicSurveyDetailView, SurveyResponseView, QrSessionView

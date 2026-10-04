@@ -12,7 +12,7 @@ from .views import (
     NfcTagView, TagSessionView,
     AdminOverviewView, AdminOrganizationListView, AdminOrgDetailView, AdminOrgTagsView,
     AdminTagListView, AdminTagDetailView, AdminRecentSignupsView, AdminOrgLocationsView,
-    CheckoutView, PortalView, WebhookView,
+    CheckoutView, PortalView, StartTrialView, WebhookView,
     IncentiveListCreateView, IncentiveDetailView, IncentiveAssignView,
     RedeemValidateView, RedeemUseView,
     ContactSubmissionView,
@@ -96,5 +96,6 @@ urlpatterns = [
     # Billing
     path('billing/checkout/', CheckoutView.as_view()),
     path('billing/portal/',   PortalView.as_view()),
+    path('billing/trial/',    StartTrialView.as_view()),
     path('billing/webhook/',  WebhookView.as_view()),
 ]

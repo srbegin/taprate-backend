@@ -1,10 +1,11 @@
 """
-Celery tasks for TapRate.
+Celery tasks for Cleanpulse and TapRate.
 
 Required environment variables:
     RESEND_API_KEY     — Resend API key
-    ALERTS_FROM_EMAIL  — verified sender address (default: alerts@taprate.app)
-    FRONTEND_URL       — used to build dashboard deep-link in emails
+
+Sender addresses, site URLs and per-brand email on/off switches come from the
+brand config in products.py.
 """
 
 import os
@@ -12,14 +13,23 @@ import logging
 from celery import shared_task
 from django.core.management import call_command
 
+from .products import DEFAULT_PRODUCT, get_brand
+
 logger = logging.getLogger(__name__)
 
 
-def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> bool:
+def _send_email(*, to: str, subject: str, html_body: str, text_body: str,
+                product: str = DEFAULT_PRODUCT):
     """
-    Send a transactional email via Resend.
-    Returns True on success, False on failure.
+    Send a transactional email via Resend, from the product's brand.
+    Returns True on success, False on failure (caller retries), or None when
+    email is switched off for that brand (not an error — don't retry).
     """
+    brand = get_brand(product)
+    if not brand.email_enabled:
+        logger.info(f'Email disabled for {brand.name} — not sending "{subject}" to {to}')
+        return None
+
     import resend
 
     api_key = os.environ.get('RESEND_API_KEY')
@@ -28,11 +38,10 @@ def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> boo
         return False
 
     resend.api_key = api_key
-    from_email = os.environ.get('ALERTS_FROM_EMAIL', 'alerts@taprate.app')
 
     try:
         response = resend.Emails.send({
-            'from': f'TapRate <{from_email}>',
+            'from': f'{brand.name} <{brand.alerts_from_email}>',
             'to': [to],
             'subject': subject,
             'html': html_body,
@@ -50,7 +59,7 @@ def _send_email(*, to: str, subject: str, html_body: str, text_body: str) -> boo
 # ── Welcome email ──────────────────────────────────────────────────────────────
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=30)
-def send_welcome_email(self, user_id):
+def send_welcome_email(self, user_id, product=DEFAULT_PRODUCT):
     """
     Fired immediately after a new account is created via RegisterView.
     Sends a branded welcome email with quick-start steps.
@@ -65,14 +74,14 @@ def send_welcome_email(self, user_id):
 
     first_name   = user.first_name or 'there'
     org_name     = user.organization.name if user.organization else 'your organization'
-    frontend_url = os.environ.get('FRONTEND_URL', 'https://taprate.app')
-    dashboard_url = f"{frontend_url}/dashboard"
+    brand        = get_brand(product)
+    dashboard_url = f"{brand.frontend_url}/dashboard"
 
-    subject = f"Welcome to TapRate, {first_name}!"
+    subject = f"Welcome to {brand.name}, {first_name}!"
 
     text_body = (
         f"Hi {first_name},\n\n"
-        f"Your TapRate account for {org_name} is ready.\n\n"
+        f"Your {brand.name} account for {org_name} is ready.\n\n"
         f"Here's how to get started:\n"
         f"1. Create a location — a spot where you'll collect feedback\n"
         f"2. Set up a survey — star ratings, comments, review redirects\n"
@@ -80,7 +89,7 @@ def send_welcome_email(self, user_id):
         f"4. Place it at your location and start collecting responses\n\n"
         f"Head to your dashboard to get started:\n{dashboard_url}\n\n"
         f"Questions? Reply to this email — we're happy to help.\n\n"
-        f"— The TapRate team"
+        f"— The {brand.name} team"
     )
 
     html_body = f"""
@@ -88,13 +97,13 @@ def send_welcome_email(self, user_id):
                 max-width: 480px; margin: 0 auto; padding: 32px 24px; color: #111;">
 
       <p style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
-                color: #888; margin: 0 0 24px;">TapRate</p>
+                color: #888; margin: 0 0 24px;">{brand.name}</p>
 
       <h1 style="font-size: 24px; font-weight: 600; margin: 0 0 8px; color: #111;">
         Welcome, {first_name}! 👋
       </h1>
       <p style="font-size: 15px; color: #555; margin: 0 0 28px; line-height: 1.6;">
-        Your TapRate account for <strong>{org_name}</strong> is ready.
+        Your {brand.name} account for <strong>{org_name}</strong> is ready.
         Here's how to collect your first piece of feedback.
       </p>
 
@@ -166,7 +175,7 @@ def send_welcome_email(self, user_id):
       </p>
 
       <p style="font-size: 12px; color: #bbb; margin: 24px 0 0;">
-        — The TapRate team
+        — The {brand.name} team
       </p>
     </div>
     """
@@ -176,9 +185,10 @@ def send_welcome_email(self, user_id):
         subject=subject,
         html_body=html_body,
         text_body=text_body,
+        product=product,
     )
 
-    if not success:
+    if success is False:
         try:
             raise self.retry()
         except self.MaxRetriesExceededError:
@@ -188,7 +198,7 @@ def send_welcome_email(self, user_id):
 # ── Password reset email ───────────────────────────────────────────────────────
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=30)
-def send_password_reset_email(self, user_id, reset_url):
+def send_password_reset_email(self, user_id, reset_url, product=DEFAULT_PRODUCT):
     """
     Fired by PasswordResetRequestView after generating a signed reset token.
     The reset_url contains the uid + token and is valid for PASSWORD_RESET_TIMEOUT
@@ -203,18 +213,19 @@ def send_password_reset_email(self, user_id, reset_url):
         logger.warning(f'send_password_reset_email: User {user_id} not found')
         return
 
+    brand      = get_brand(product)
     first_name = user.first_name or 'there'
-    subject    = 'Reset your TapRate password'
+    subject    = f'Reset your {brand.name} password'
 
     text_body = (
         f"Hi {first_name},\n\n"
-        f"We received a request to reset the password for your TapRate account.\n\n"
+        f"We received a request to reset the password for your {brand.name} account.\n\n"
         f"Click the link below to set a new password. This link expires in 3 days "
         f"and can only be used once.\n\n"
         f"{reset_url}\n\n"
         f"If you didn't request this, you can safely ignore this email — "
         f"your password won't be changed.\n\n"
-        f"— The TapRate team"
+        f"— The {brand.name} team"
     )
 
     html_body = f"""
@@ -222,13 +233,13 @@ def send_password_reset_email(self, user_id, reset_url):
                 max-width: 480px; margin: 0 auto; padding: 32px 24px; color: #111;">
 
       <p style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
-                color: #888; margin: 0 0 24px;">TapRate</p>
+                color: #888; margin: 0 0 24px;">{brand.name}</p>
 
       <h1 style="font-size: 22px; font-weight: 600; margin: 0 0 8px; color: #111;">
         Reset your password
       </h1>
       <p style="font-size: 15px; color: #555; margin: 0 0 24px; line-height: 1.6;">
-        Hi {first_name} — we received a request to reset the password on your TapRate account.
+        Hi {first_name} — we received a request to reset the password on your {brand.name} account.
         Click the button below to choose a new one.
       </p>
 
@@ -256,7 +267,7 @@ def send_password_reset_email(self, user_id, reset_url):
       </p>
 
       <p style="font-size: 12px; color: #bbb; margin: 24px 0 0;">
-        — The TapRate team
+        — The {brand.name} team
       </p>
     </div>
     """
@@ -266,9 +277,10 @@ def send_password_reset_email(self, user_id, reset_url):
         subject=subject,
         html_body=html_body,
         text_body=text_body,
+        product=product,
     )
 
-    if not success:
+    if success is False:
         try:
             raise self.retry()
         except self.MaxRetriesExceededError:
@@ -324,7 +336,8 @@ def send_alert(self, alert_id):
     location_name     = alert.location.name
     rating            = alert.rating
     stars             = '★' * rating + '☆' * (5 - rating)
-    dashboard_url     = os.environ.get('FRONTEND_URL', 'https://taprate.app') + '/dashboard/insights'
+    brand             = get_brand(alert.location.product)
+    dashboard_url     = brand.frontend_url + brand.alerts_dashboard_path
     comment           = survey_response.comment or ''
 
     # Recovery fields
@@ -399,7 +412,7 @@ def send_alert(self, alert_id):
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                 max-width: 480px; margin: 0 auto; padding: 32px 24px; color: #111;">
       <p style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
-                color: #888; margin: 0 0 24px;">TapRate Alert</p>
+                color: #888; margin: 0 0 24px;">{brand.name} Alert</p>
 
       <h1 style="font-size: 22px; font-weight: 600; margin: 0 0 8px;">
         Low rating received
@@ -426,7 +439,7 @@ def send_alert(self, alert_id):
       </a>
 
       <p style="font-size: 12px; color: #bbb; margin: 32px 0 0;">
-        You're receiving this because your TapRate account has alert notifications enabled.
+        You're receiving this because your {brand.name} account has alert notifications enabled.
       </p>
     </div>
     """
@@ -436,13 +449,14 @@ def send_alert(self, alert_id):
         subject=subject,
         html_body=html_body,
         text_body=text_body,
+        product=brand.product,
     )
 
     if success:
         alert.status = 'owner_notified'
         alert.save(update_fields=['status'])
         logger.info(f'Alert email sent for alert {alert_id} to {recipient}')
-    else:
+    elif success is False:
         try:
             raise self.retry()
         except self.MaxRetriesExceededError:

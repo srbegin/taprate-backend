@@ -1,6 +1,5 @@
 import io
 import qrcode
-import os
 from django.http import HttpResponse
 from django.core.cache import cache
 import uuid as uuid_lib
@@ -26,7 +25,8 @@ from ..serializers import (
     SurveySerializer, SurveyWriteSerializer,
 )
 from ..utils.responses import list_response
-from .billing_views import PLAN_BASE_LOCATIONS, OVERAGE_PRICE_PER_LOCATION, _sync_overage_quantity
+from ..products import get_brand, get_product
+from .billing_views import OVERAGE_PRICE_PER_LOCATION, _sync_overage_quantity, location_usage
 
 
 
@@ -36,16 +36,15 @@ class LocationListView(APIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
-        org = request.user.organization
+        org     = request.user.organization
+        product = get_product(request)
         locations = Location.objects.filter(
-            organization=org
+            organization=org, product=product,
         ).select_related('survey').order_by('-created_at')
         serializer = LocationSerializer(locations, many=True, context={'request': request})
 
-        count = locations.count()
-        base  = PLAN_BASE_LOCATIONS.get(org.plan)  # None for trial/free — no cap
-        overage_count = max(0, count - base) if base is not None else 0
-        overage_cost  = overage_count * OVERAGE_PRICE_PER_LOCATION
+        _, base, overage_count = location_usage(org, product)  # base None for trial — no cap
+        overage_cost = overage_count * OVERAGE_PRICE_PER_LOCATION.get(product, 0)
 
         return Response(list_response(
             serializer.data,
@@ -57,16 +56,17 @@ class LocationListView(APIView):
         ))
 
     def post(self, request):
-        org = request.user.organization
+        org     = request.user.organization
+        product = get_product(request)
 
         serializer = LocationSerializer(data=request.data, context={'request': request})
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save(organization=org)
+        serializer.save(organization=org, product=product)
 
         # Sync overage quantity to Stripe for active paid subscribers.
-        # No-op for trial/free orgs — they have no subscription yet.
-        _sync_overage_quantity(org)
+        # No-op for trial orgs — they have no Stripe subscription yet.
+        _sync_overage_quantity(org, product)
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -75,7 +75,9 @@ class LocationDetailView(APIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def _get_location(self, request, pk):
-        return get_object_or_404(Location, id=pk, organization=request.user.organization)
+        return get_object_or_404(
+            Location, id=pk, organization=request.user.organization, product=get_product(request),
+        )
 
     def get(self, request, pk):
         location = self._get_location(request, pk)
@@ -92,7 +94,9 @@ class LocationDetailView(APIView):
         return Response(serializer.data)
 
     def delete(self, request, pk):
-        self._get_location(request, pk).delete()
+        location = self._get_location(request, pk)
+        location.delete()
+        _sync_overage_quantity(request.user.organization, location.product)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -102,7 +106,7 @@ class LocationPreviewView(APIView):
 
     def post(self, request, pk):
         location = get_object_or_404(
-            Location, id=pk, organization=request.user.organization
+            Location, id=pk, organization=request.user.organization, product=get_product(request),
         )
         if not location.survey:
             return Response(
@@ -127,7 +131,7 @@ class SurveyListView(APIView):
 
     def get(self, request):
         surveys = Survey.objects.filter(
-            organization=request.user.organization
+            organization=request.user.organization, product=get_product(request),
         ).prefetch_related('questions', 'incentives', 'locations').order_by('-created_at')
         data = SurveySerializer(surveys, many=True).data
         return Response(list_response(data))
@@ -139,7 +143,9 @@ class SurveyListView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        survey = serializer.save(organization=request.user.organization)
+        survey = serializer.save(
+            organization=request.user.organization, product=get_product(request),
+        )
 
         for i, q_data in enumerate(questions_data):
             q_data.setdefault('position', i)
@@ -158,7 +164,9 @@ class SurveyDetailView(APIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def _get_survey(self, request, pk):
-        return get_object_or_404(Survey, id=pk, organization=request.user.organization)
+        return get_object_or_404(
+            Survey, id=pk, organization=request.user.organization, product=get_product(request),
+        )
 
     def get(self, request, pk):
         return Response(SurveySerializer(self._get_survey(request, pk)).data)
@@ -182,7 +190,9 @@ class QuestionListView(APIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def _get_survey(self, request, survey_pk):
-        return get_object_or_404(Survey, id=survey_pk, organization=request.user.organization)
+        return get_object_or_404(
+            Survey, id=survey_pk, organization=request.user.organization, product=get_product(request),
+        )
 
     def get(self, request, survey_pk):
         survey = self._get_survey(request, survey_pk)
@@ -209,6 +219,7 @@ class QuestionDetailView(APIView):
             Question,
             id=pk,
             survey_id=survey_pk,
+            survey__product=get_product(request),
             organization=request.user.organization,
         )
 
@@ -237,6 +248,7 @@ class AlertListView(APIView):
         status_filter = request.query_params.get('status', 'pending')
         qs = Alert.objects.filter(
             location__organization=request.user.organization,
+            location__product=get_product(request),
             survey_response__is_test=False,
         ).select_related('location', 'survey_response').order_by('-created_at')
         if status_filter != 'all':
@@ -263,7 +275,9 @@ class AlertDetailView(APIView):
 
     def patch(self, request, pk):
         alert = get_object_or_404(
-            Alert, id=pk, location__organization=request.user.organization
+            Alert, id=pk,
+            location__organization=request.user.organization,
+            location__product=get_product(request),
         )
         new_status = request.data.get('status')
         if new_status not in ('pending', 'owner_notified', 'resolved'):
@@ -292,7 +306,8 @@ class InsightsView(APIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
-        org = request.user.organization
+        org     = request.user.organization
+        product = get_product(request)
         try:
             days = min(int(request.query_params.get('days', 30)), 90)
         except (ValueError, TypeError):
@@ -308,6 +323,7 @@ class InsightsView(APIView):
         # Base queryset — real responses only
         base_qs = SurveyResponse.objects.filter(
             location__organization=org,
+            location__product=product,
             is_test=False,
         )
         if location_id:
@@ -325,6 +341,7 @@ class InsightsView(APIView):
         # Count test responses in the same period so the frontend can surface a notice
         test_qs = SurveyResponse.objects.filter(
             location__organization=org,
+            location__product=product,
             is_test=True,
             created_at__gte=period_start,
         )
@@ -369,6 +386,7 @@ class InsightsView(APIView):
 
         alert_qs = Alert.objects.filter(
             location__organization=org,
+            location__product=product,
             status__in=['pending', 'owner_notified'],
             survey_response__is_test=False,
         ).select_related('location').order_by('-created_at')
@@ -421,7 +439,11 @@ class CommentFeedView(APIView):
 
         qs = (
             SurveyResponse.objects
-            .filter(location__organization=org, is_test=show_test)
+            .filter(
+                location__organization=org,
+                location__product=get_product(request),
+                is_test=show_test,
+            )
             .exclude(comment='')
             .select_related('location', 'survey')
             .order_by('-created_at')
@@ -486,7 +508,9 @@ class OrganizationView(APIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request):
-        return Response(OrganizationSerializer(request.user.organization).data)
+        return Response(
+            OrganizationSerializer(request.user.organization, context={'request': request}).data
+        )
 
     def patch(self, request):
         org = request.user.organization
@@ -499,7 +523,9 @@ class OrganizationView(APIView):
 
         allowed = {k: v for k, v in request.data.items() if k in _ORG_WRITABLE_FIELDS}
 
-        serializer = OrganizationSerializer(org, data=allowed, partial=True)
+        serializer = OrganizationSerializer(
+            org, data=allowed, partial=True, context={'request': request},
+        )
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         serializer.save()
@@ -510,7 +536,9 @@ class QRCodeView(APIView):
     permission_classes = [IsAuthenticated, HasActiveAccess]
 
     def get(self, request, pk):
-        location = get_object_or_404(Location, id=pk, organization=request.user.organization)
+        location = get_object_or_404(
+            Location, id=pk, organization=request.user.organization, product=get_product(request),
+        )
 
         if not location.qr_enabled:
             return Response(
@@ -524,8 +552,7 @@ class QRCodeView(APIView):
             box_size=10,
             border=4,
         )
-        frontend_url = os.environ.get('FRONTEND_URL', 'https://taprate.app')
-        qr.add_data(f"{frontend_url}/qr/{location.id}")
+        qr.add_data(f"{get_brand(location.product).frontend_url}/qr/{location.id}")
         qr.make(fit=True)
 
         img = qr.make_image(fill_color='black', back_color='white')

@@ -21,6 +21,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import ContactSubmission, Location
+from ..products import TAPRATE, get_brand, get_product
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +36,21 @@ def _get_client_ip(request):
 
 
 def _send_notification(submission):
-    """Send internal notification email to hello@taprate.app."""
+    """
+    Internal new-lead notification. Always sent from the TapRate (verified)
+    domain to the ops inbox (CONTACT_NOTIFY_EMAIL), whichever brand the lead
+    came from — so Cleanpulse leads arrive before cleanpulse.app is verified.
+    """
     try:
         import resend
         resend.api_key = os.environ.get('RESEND_API_KEY', '')
 
+        ops        = get_brand(TAPRATE)
+        lead_brand = get_brand(submission.product)
+        notify_to  = os.environ.get('CONTACT_NOTIFY_EMAIL', ops.hello_email)
+
         body = f"""
-<p>New contact form submission on TapRate:</p>
+<p>New contact form submission on {lead_brand.name}:</p>
 <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px;">
   <tr><td style="padding:4px 12px 4px 0;font-weight:600;">Name</td><td>{submission.name}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:600;">Business</td><td>{submission.business_name}</td></tr>
@@ -55,9 +64,9 @@ def _send_notification(submission):
 """.strip()
 
         resend.Emails.send({
-            'from': 'TapRate <hello@taprate.app>',
-            'to': ['hello@taprate.app'],
-            'subject': f'[TapRate] New contact: {submission.business_name}',
+            'from': f'{ops.name} <{ops.hello_email}>',
+            'to': [notify_to],
+            'subject': f'[{lead_brand.name}] New contact: {submission.business_name}',
             'html': body,
         })
     except Exception:
@@ -65,23 +74,27 @@ def _send_notification(submission):
 
 
 def _send_autoreply(submission):
-    """Send auto-reply confirmation to the prospect."""
+    """Send auto-reply confirmation to the prospect, from the lead's brand."""
+    brand = get_brand(submission.product)
+    if not brand.email_enabled:
+        logger.info('Email disabled for %s — skipping contact auto-reply to %s', brand.name, submission.email)
+        return
     try:
         import resend
         resend.api_key = os.environ.get('RESEND_API_KEY', '')
 
         body = f"""
 <p>Hi {submission.name},</p>
-<p>Thanks for reaching out about TapRate! We received your message and will be in touch within 1 business day.</p>
+<p>Thanks for reaching out about {brand.name}! We received your message and will be in touch within 1 business day.</p>
 <p>If you have any urgent questions in the meantime, you can reply directly to this email.</p>
-<p>— The TapRate Team</p>
+<p>— The {brand.name} Team</p>
 """.strip()
 
         resend.Emails.send({
-            'from': 'TapRate <hello@taprate.app>',
+            'from': f'{brand.name} <{brand.hello_email}>',
             'to': [submission.email],
-            'reply_to': 'hello@taprate.app',
-            'subject': 'Thanks for reaching out to TapRate',
+            'reply_to': brand.hello_email,
+            'subject': f'Thanks for reaching out to {brand.name}',
             'html': body,
         })
     except Exception:
@@ -136,6 +149,7 @@ class ContactSubmissionView(APIView):
 
         # ── Persist
         submission = ContactSubmission.objects.create(
+            product=get_product(request),
             name=str(data.get('name', '')).strip(),
             business_name=str(data.get('business_name', '')).strip(),
             email=email,
@@ -208,6 +222,7 @@ class DemoSessionView(APIView):
 def _serialize_submission(s):
     return {
         'id':             str(s.id),
+        'product':        s.product,
         'name':           s.name,
         'business_name':  s.business_name,
         'email':          s.email,

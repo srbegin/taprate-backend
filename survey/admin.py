@@ -1,7 +1,10 @@
 from django.contrib import admin
-from .models import Organization, User, Survey, Incentive, Location, SurveyResponse, Alert, NfcTag
+from .models import (
+    Organization, Subscription, User, Survey, Incentive, Location, SurveyResponse, Alert, NfcTag,
+)
 
 admin.site.register(Organization)
+admin.site.register(Subscription)
 admin.site.register(User)
 admin.site.register(Survey)
 admin.site.register(Incentive)

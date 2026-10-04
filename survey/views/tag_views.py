@@ -10,6 +10,7 @@ from django.utils import timezone
 from django.core.cache import cache
 
 from ..permissions import HasActiveAccess
+from ..products import get_product
 from ..models import NfcTag, Location
 
 # Session token TTL in seconds (30 minutes)
@@ -39,12 +40,14 @@ class NfcTagView(APIView):
     def get(self, request, tag_id):
         """Public — check if tag is claimed."""
         tag = get_object_or_404(NfcTag, id=tag_id)
+        # product lets the taprate.app claim page forward Cleanpulse tags to cleanpulse.app
         if tag.location:
             return Response({
                 'claimed': True,
                 'location_id': str(tag.location.id),
+                'product': tag.product or None,
             })
-        return Response({'claimed': False})
+        return Response({'claimed': False, 'product': tag.product or None})
 
     def post(self, request, tag_id):
         """Authenticated — claim or reassign tag to a location."""
@@ -56,7 +59,8 @@ class NfcTagView(APIView):
             )
 
         location = get_object_or_404(
-            Location, id=location_id, organization=request.user.organization
+            Location, id=location_id, organization=request.user.organization,
+            product=get_product(request),
         )
 
         tag = get_object_or_404(NfcTag, id=tag_id)
@@ -68,8 +72,16 @@ class NfcTagView(APIView):
                 status=status.HTTP_403_FORBIDDEN
             )
 
+        # Block if the tag is allocated to the other product
+        if tag.product and tag.product != location.product:
+            return Response(
+                {'detail': 'This tag belongs to a different product.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
         tag.organization = request.user.organization
         tag.location = location
+        tag.product = location.product
         tag.claimed_at = timezone.now()
         tag.save()
 
