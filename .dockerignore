@@ -2,3 +2,9 @@ fly.toml
 .git/
 *.sqlite3
 venv
+# Never bake local env, credentials or data dumps into the image
+.env
+*.env
+*.sql
+*.rdb
+.DS_Store
