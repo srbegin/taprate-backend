@@ -10,6 +10,7 @@ brand config in products.py.
 
 import os
 import logging
+from html import escape
 from celery import shared_task
 from django.core.management import call_command
 
@@ -289,6 +290,15 @@ def send_password_reset_email(self, user_id, reset_url, product=DEFAULT_PRODUCT)
 
 # ── Alert email ────────────────────────────────────────────────────────────────
 
+def _alert_recipient(org):
+    """org.alert_email if set, otherwise the owner's email (None if neither)."""
+    from .models import User
+    if org.alert_email:
+        return org.alert_email
+    owner = User.objects.filter(organization=org, role='owner').first()
+    return owner.email if owner else None
+
+
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def send_alert(self, alert_id):
     """
@@ -302,7 +312,7 @@ def send_alert(self, alert_id):
 
     Sets alert.status = 'owner_notified' on successful send.
     """
-    from .models import Alert, User
+    from .models import Alert
 
     try:
         alert = Alert.objects.select_related(
@@ -323,14 +333,10 @@ def send_alert(self, alert_id):
         logger.info(f'send_alert: alerts disabled for org {org.id} — skipping')
         return
 
-    # Recipient: org.alert_email if set, otherwise the owner's email
-    recipient = org.alert_email
+    recipient = _alert_recipient(org)
     if not recipient:
-        owner = User.objects.filter(organization=org, role='owner').first()
-        if not owner:
-            logger.warning(f'send_alert: No recipient found for org {org.id}')
-            return
-        recipient = owner.email
+        logger.warning(f'send_alert: No recipient found for org {org.id}')
+        return
 
     survey_response   = alert.survey_response
     location_name     = alert.location.name
@@ -461,6 +467,116 @@ def send_alert(self, alert_id):
             raise self.retry()
         except self.MaxRetriesExceededError:
             logger.error(f'send_alert: max retries exceeded for alert {alert_id}')
+
+
+# ── Issue alert email ──────────────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_issue_alerts(self, alert_ids):
+    """
+    One email for the issues newly reported in a single submission
+    (e.g. "Restroom 2: Out of soap, Trash is full"). Repeat reports of an
+    issue that already has an open alert never get here — they only bump
+    the alert's report_count (see survey_views._record_issue_alerts).
+
+    Sets each alert's status = 'owner_notified' on successful send.
+    """
+    from .models import Alert
+
+    alerts = list(
+        Alert.objects.select_related('location__organization', 'survey_response')
+        .filter(id__in=alert_ids, kind='issue')
+        .order_by('created_at')
+    )
+    if not alerts:
+        logger.warning(f'send_issue_alerts: none of {alert_ids} found')
+        return
+
+    location = alerts[0].location
+    org = location.organization
+    if not org or not org.alerts_enabled:
+        logger.info(f'send_issue_alerts: alerts disabled or no org for location {location.id} — skipping')
+        return
+
+    recipient = _alert_recipient(org)
+    if not recipient:
+        logger.warning(f'send_issue_alerts: No recipient found for org {org.id}')
+        return
+
+    brand         = get_brand(location.product)
+    dashboard_url = brand.frontend_url + brand.alerts_dashboard_path
+    labels        = [a.issue_label for a in alerts]
+    comment       = alerts[0].survey_response.comment or ''
+
+    subject = f"Issue reported — {location.name}: {', '.join(labels)}"
+
+    text_lines = [f"A customer reported {'an issue' if len(labels) == 1 else 'issues'} at {location.name}:", '']
+    text_lines += [f"  • {label}" for label in labels]
+    if comment:
+        text_lines += ['', f"Comment: {comment}"]
+    text_lines += [
+        '',
+        "Repeat reports won't email you again until you resolve the alert.",
+        f"View your dashboard: {dashboard_url}",
+    ]
+    text_body = '\n'.join(text_lines)
+
+    # Labels come from the business and the comment from a customer — escape both.
+    issues_html = ''.join(
+        f'<li style="margin: 0 0 6px; font-size: 16px; color: #111;">{escape(label)}</li>' for label in labels
+    )
+    comment_html = (
+        f'<p style="margin: 16px 0 0; font-size: 14px; color: #555; font-style: italic;">&ldquo;{escape(comment)}&rdquo;</p>'
+        if comment else ''
+    )
+    html_body = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                max-width: 480px; margin: 0 auto; padding: 32px 24px; color: #111;">
+      <p style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+                color: #888; margin: 0 0 24px;">{brand.name} Alert</p>
+
+      <h1 style="font-size: 22px; font-weight: 600; margin: 0 0 8px;">
+        {'Issue' if len(labels) == 1 else 'Issues'} reported
+      </h1>
+      <p style="font-size: 15px; color: #555; margin: 0 0 24px;">
+        A customer reported {'an issue' if len(labels) == 1 else 'issues'} at <strong>{escape(location.name)}</strong>.
+      </p>
+
+      <div style="background: #fff7ed; border: 1px solid #fed7aa; border-radius: 12px;
+                  padding: 20px 24px; margin-bottom: 24px;">
+        <ul style="margin: 0; padding-left: 18px;">{issues_html}</ul>
+        {comment_html}
+      </div>
+
+      <a href="{dashboard_url}"
+         style="display: inline-block; background: #111; color: #fff; text-decoration: none;
+                font-size: 13px; font-weight: 500; padding: 10px 20px; border-radius: 8px;">
+        View dashboard →
+      </a>
+
+      <p style="font-size: 12px; color: #bbb; margin: 32px 0 0;">
+        Repeat reports of the same issue won't email you again until you resolve it.
+        You're receiving this because your {brand.name} account has alert notifications enabled.
+      </p>
+    </div>
+    """
+
+    success = _send_email(
+        to=recipient,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body,
+        product=brand.product,
+    )
+
+    if success:
+        Alert.objects.filter(id__in=[a.id for a in alerts], status='pending').update(status='owner_notified')
+        logger.info(f'Issue alert email sent for {len(alerts)} alert(s) at {location.id} to {recipient}')
+    elif success is False:
+        try:
+            raise self.retry()
+        except self.MaxRetriesExceededError:
+            logger.error(f'send_issue_alerts: max retries exceeded for {alert_ids}')
 
 
 # ── Incentive email ────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ from django.core.validators import URLValidator
 from django.utils.text import slugify
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from .models import Organization, Incentive, IncentiveWin, Survey, Question, SurveyResponse, Location
+from .models import Organization, Incentive, IncentiveWin, IssueOption, Survey, Question, SurveyResponse, Location
 from .products import DEFAULT_PRODUCT, get_brand, get_product as request_product
 
 User = get_user_model()
@@ -74,23 +74,102 @@ class RedeemSerializer(serializers.Serializer):
 
 # ── Question (individual question within a Survey) ────────────────────────────
 
+MAX_ISSUE_OPTIONS = 20
+
+
+class IssueOptionSerializer(serializers.ModelSerializer):
+    """An issue option on an 'issues' question. Send `id` to update an existing one."""
+    id = serializers.UUIDField(required=False)
+
+    class Meta:
+        model = IssueOption
+        fields = ['id', 'label', 'alerts', 'position']
+        extra_kwargs = {'position': {'required': False}, 'alerts': {'required': False}}
+
+    def validate_label(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError('Issue label is required.')
+        return value
+
+
 class QuestionSerializer(serializers.ModelSerializer):
     """Dashboard read serializer for a single question."""
+    options = IssueOptionSerializer(many=True, read_only=True)
+
     class Meta:
         model = Question
-        fields = ['id', 'question', 'scale_type', 'position', 'created_at']
+        fields = ['id', 'question', 'question_type', 'scale_type', 'active', 'position', 'options', 'created_at']
         read_only_fields = ['id', 'created_at']
 
 
 class QuestionWriteSerializer(serializers.ModelSerializer):
+    """
+    Create/update a question. For 'issues' questions, `options` is the full
+    list: existing ids are updated, new entries created, missing ones deleted.
+    """
+    options = IssueOptionSerializer(many=True, required=False)
+
     class Meta:
         model = Question
-        fields = ['question', 'scale_type', 'position']
+        fields = ['question', 'question_type', 'scale_type', 'active', 'position', 'options']
 
     def validate_position(self, value):
         if value < 0:
             raise serializers.ValidationError('Position must be 0 or greater.')
         return value
+
+    def validate_options(self, value):
+        if len(value) > MAX_ISSUE_OPTIONS:
+            raise serializers.ValidationError(f'At most {MAX_ISSUE_OPTIONS} issues per question.')
+        labels = [o['label'].lower() for o in value]
+        if len(labels) != len(set(labels)):
+            raise serializers.ValidationError('Issue labels must be unique.')
+        return value
+
+    def validate(self, attrs):
+        question_type = attrs.get('question_type') or getattr(self.instance, 'question_type', 'rating')
+        if question_type == 'issues':
+            options = attrs.get('options')
+            has_existing = self.instance is not None and self.instance.options.exists()
+            if (options is not None and not options) or (options is None and not has_existing):
+                raise serializers.ValidationError({'options': 'Add at least one issue.'})
+        return attrs
+
+    def create(self, validated_data):
+        options = validated_data.pop('options', [])
+        question = super().create(validated_data)
+        self._save_options(question, options)
+        return question
+
+    def update(self, instance, validated_data):
+        options = validated_data.pop('options', None)
+        question = super().update(instance, validated_data)
+        if options is not None:
+            self._save_options(question, options)
+        return question
+
+    @staticmethod
+    def _save_options(question, options):
+        existing = {str(o.id): o for o in question.options.all()}
+        keep = set()
+        for i, data in enumerate(options):
+            fields = {
+                'label':    data['label'],
+                'alerts':   data.get('alerts', True),
+                'position': data.get('position', i),
+            }
+            option = existing.get(str(data['id'])) if data.get('id') else None
+            if option:
+                for key, value in fields.items():
+                    setattr(option, key, value)
+                option.save()
+            else:
+                option = IssueOption.objects.create(question=question, **fields)
+            keep.add(str(option.id))
+        for option_id, option in existing.items():
+            if option_id not in keep:
+                option.delete()
 
 
 # ── Survey (collection of questions) ─────────────────────────────────────────
@@ -146,16 +225,24 @@ class SurveyWriteSerializer(serializers.ModelSerializer):
 
 # ── Public serializers (PWA) ──────────────────────────────────────────────────
 
+class IssueOptionPublicSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = IssueOption
+        fields = ['id', 'label']
+
+
 class QuestionPublicSerializer(serializers.ModelSerializer):
     """One question as seen by the PWA survey stepper."""
+    options = IssueOptionPublicSerializer(many=True, read_only=True)
+
     class Meta:
         model = Question
-        fields = ['id', 'question', 'scale_type', 'position']
+        fields = ['id', 'question', 'question_type', 'scale_type', 'position', 'options']
 
 
 class SurveyPublicSerializer(serializers.ModelSerializer):
     """Full survey as returned by the public NFC tap endpoint."""
-    questions     = QuestionPublicSerializer(many=True, read_only=True)
+    questions     = serializers.SerializerMethodField()   # active questions only
     brand_color   = serializers.CharField(source='organization.brand_color', read_only=True)
     org_name      = serializers.CharField(source='organization.name', read_only=True)
     logo_url      = serializers.CharField(source='organization.logo_url', read_only=True)
@@ -175,6 +262,10 @@ class SurveyPublicSerializer(serializers.ModelSerializer):
             'questions',
         ]
 
+    def get_questions(self, obj):
+        questions = obj.questions.filter(active=True).prefetch_related('options')
+        return QuestionPublicSerializer(questions, many=True).data
+
     def get_location_name(self, obj):
         location = self.context.get('location')
         return location.name if location else None
@@ -189,9 +280,16 @@ class SurveyPublicSerializer(serializers.ModelSerializer):
 # ── Response serializer ───────────────────────────────────────────────────────
 
 class SingleResponseSerializer(serializers.Serializer):
-    """One rating within a multi-question submission."""
+    """
+    One answer within a multi-question submission: `rating` for rating
+    questions, `issue_ids` for issues questions (empty list = "all good").
+    SurveyResponseView checks which one applies to each question.
+    """
     question_id = serializers.UUIDField()
-    rating      = serializers.IntegerField(min_value=1, max_value=5)
+    rating      = serializers.IntegerField(min_value=1, max_value=5, required=False, allow_null=True)
+    issue_ids   = serializers.ListField(
+                      child=serializers.UUIDField(), required=False, max_length=MAX_ISSUE_OPTIONS,
+                  )
 
 
 class SurveyResponseSubmitSerializer(serializers.Serializer):

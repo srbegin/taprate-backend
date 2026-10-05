@@ -1,7 +1,8 @@
 """
-Tests for the product layer: per-product subscriptions, X-Product scoping,
-brand config, billing, NFC tag claims, brand-aware email, and the 0018 data
-migration.
+Tests for the product layer (per-product subscriptions, X-Product scoping,
+brand config, billing, NFC tag claims, brand-aware email, the 0018 data
+migration) and for issues questions (builder, submit, deduped alerts,
+insights, issue alert email).
 
 Run against Postgres (DATABASE_URL) with a Redis cache (REDIS_URL), e.g.:
     DATABASE_URL=postgresql://postgres:postgres@localhost:5432/taprate \\
@@ -20,8 +21,8 @@ from rest_framework.test import APIClient
 
 from . import tasks
 from .models import (
-    Alert, ContactSubmission, Location, NfcTag, Organization, Subscription, Survey,
-    SurveyResponse, User,
+    Alert, ContactSubmission, IssueOption, Location, NfcTag, Organization, Question,
+    ResponseIssue, Subscription, Survey, SurveyResponse, User,
 )
 from .products import CLEANPULSE, TAPRATE
 from .views import billing_views
@@ -430,3 +431,242 @@ class BillingDataMigrationTests(TransactionTestCase):
         self.assertEqual((t.product, t.plan, t.status), ('taprate', '', 'trialing'))   # 'free' never carried over
         self.assertEqual(t.trial_ends_at, trial_end)
         self.assertEqual(sorted(Tag.objects.values_list('product', flat=True)), ['', 'taprate'])
+
+
+# ── Issues questions ─────────────────────────────────────────────────────────
+
+class IssueQuestionFixture:
+    """A TapRate org with a restroom survey: a rating question then an issues question."""
+
+    def setUp(self):
+        cache.clear()
+        self.org  = make_org(taprate=trial())
+        self.user = make_user(self.org)
+        self.survey = Survey.objects.create(organization=self.org, name='Restroom Check', alert_threshold=2)
+        self.rating_q = Question.objects.create(
+            organization=self.org, survey=self.survey, question='How clean?', scale_type='stars', position=0,
+        )
+        self.issues_q = Question.objects.create(
+            organization=self.org, survey=self.survey, question='Anything need attention?',
+            question_type='issues', position=1,
+        )
+        self.soap   = IssueOption.objects.create(question=self.issues_q, label='Out of soap', position=0)
+        self.trash  = IssueOption.objects.create(question=self.issues_q, label='Trash is full', position=1)
+        self.odor   = IssueOption.objects.create(question=self.issues_q, label='Bad odor', position=2, alerts=False)
+        self.location = Location.objects.create(organization=self.org, name='Restroom 2', survey=self.survey)
+
+    def token(self):
+        res = APIClient().post(f'/api/survey/location/{self.location.id}/session/')
+        self.assertEqual(res.status_code, 201)
+        return res.data['token']
+
+    def submit(self, issue_ids=(), rating=4, token=None):
+        token = token or self.token()
+        payload = {'responses': [
+            {'question_id': str(self.rating_q.id), 'rating': rating},
+            {'question_id': str(self.issues_q.id), 'issue_ids': [str(i) for i in issue_ids]},
+        ]}
+        return APIClient().post(f'/api/survey/{token}/response/', payload, format='json')
+
+
+@mock.patch('survey.tasks.send_alert.delay')
+@mock.patch('survey.tasks.send_issue_alerts.delay')
+class IssueSubmitTests(IssueQuestionFixture, TestCase):
+
+    def test_public_survey_includes_options_and_hides_inactive_questions(self, issue_mail, rating_mail):
+        Question.objects.create(organization=self.org, survey=self.survey, question='Hidden', position=2, active=False)
+        survey = APIClient().get(f'/api/survey/{self.token()}/').data['survey']
+        self.assertEqual([q['question'] for q in survey['questions']], ['How clean?', 'Anything need attention?'])
+        issues = survey['questions'][1]
+        self.assertEqual(issues['question_type'], 'issues')
+        self.assertEqual([o['label'] for o in issues['options']], ['Out of soap', 'Trash is full', 'Bad odor'])
+        self.assertNotIn('alerts', issues['options'][0])   # internal flag stays private
+
+    def test_issues_recorded_and_alerting_ones_alert(self, issue_mail, rating_mail):
+        res = self.submit([self.soap.id, self.odor.id])
+        self.assertEqual(res.status_code, 201, res.data)
+
+        answer = SurveyResponse.objects.get(question=self.issues_q)
+        self.assertIsNone(answer.rating)
+        self.assertEqual(sorted(answer.issues.values_list('label', flat=True)), ['Bad odor', 'Out of soap'])
+
+        alert = Alert.objects.get(kind='issue')            # 'Bad odor' has alerts off
+        self.assertEqual((alert.issue_label, alert.report_count, alert.status), ('Out of soap', 1, 'pending'))
+        issue_mail.assert_called_once_with([str(alert.id)])
+        rating_mail.assert_not_called()
+
+    def test_repeat_report_bumps_open_alert_without_new_email(self, issue_mail, rating_mail):
+        self.submit([self.soap.id])
+        self.submit([self.soap.id, self.trash.id])
+
+        soap = Alert.objects.get(issue_label='Out of soap')
+        self.assertEqual(soap.report_count, 2)
+        self.assertEqual(Alert.objects.filter(kind='issue').count(), 2)
+        self.assertEqual(issue_mail.call_count, 2)
+        self.assertEqual(issue_mail.call_args_list[1].args[0],
+                         [str(Alert.objects.get(issue_label='Trash is full').id)])   # only the new issue
+
+    def test_resolving_rearms_the_issue(self, issue_mail, rating_mail):
+        self.submit([self.soap.id])
+        Alert.objects.filter(kind='issue').update(status='resolved')
+        self.submit([self.soap.id])
+        self.assertEqual(Alert.objects.filter(issue_label='Out of soap').count(), 2)
+        self.assertEqual(issue_mail.call_count, 2)
+
+    def test_nothing_selected_is_recorded_as_all_good(self, issue_mail, rating_mail):
+        self.assertEqual(self.submit([]).status_code, 201)
+        answer = SurveyResponse.objects.get(question=self.issues_q)
+        self.assertEqual(answer.issues.count(), 0)
+        self.assertFalse(Alert.objects.exists())
+        issue_mail.assert_not_called()
+
+    def test_low_rating_alert_still_works_alongside_issues(self, issue_mail, rating_mail):
+        self.submit([self.trash.id], rating=1)
+        self.assertEqual(sorted(Alert.objects.values_list('kind', flat=True)), ['issue', 'low_rating'])
+        rating_mail.assert_called_once()
+
+    def test_unknown_issue_rejected_without_burning_the_token(self, issue_mail, rating_mail):
+        token = self.token()
+        other = IssueOption.objects.create(
+            question=Question.objects.create(organization=self.org, question_type='issues', question='x'),
+            label='Elsewhere',
+        )
+        self.assertEqual(self.submit([other.id], token=token).status_code, 400)
+        self.assertEqual(self.submit([self.soap.id], token=token).status_code, 201)
+
+    def test_rating_question_requires_rating(self, issue_mail, rating_mail):
+        token = self.token()
+        payload = {'responses': [{'question_id': str(self.rating_q.id)}]}
+        res = APIClient().post(f'/api/survey/{token}/response/', payload, format='json')
+        self.assertEqual(res.status_code, 400)
+
+    def test_inactive_question_rejected(self, issue_mail, rating_mail):
+        self.issues_q.active = False
+        self.issues_q.save()
+        self.assertEqual(self.submit([self.soap.id]).status_code, 400)
+
+    def test_test_mode_records_issues_but_raises_no_alerts(self, issue_mail, rating_mail):
+        self.org.test_mode = True
+        self.org.save()
+        self.submit([self.soap.id], rating=1)
+        self.assertEqual(ResponseIssue.objects.count(), 1)
+        self.assertFalse(Alert.objects.exists())
+
+
+class IssueBuilderTests(TestCase):
+
+    def setUp(self):
+        self.org    = make_org(taprate=trial())
+        self.user   = make_user(self.org)
+        self.survey = Survey.objects.create(organization=self.org, name='Restroom Check')
+        self.url    = f'/api/dashboard/surveys/{self.survey.id}/questions/'
+
+    def test_create_issues_question_with_options(self):
+        res = api(self.user).post(self.url, {
+            'question': 'Anything need attention?', 'question_type': 'issues',
+            'options': [{'label': 'Out of soap'}, {'label': 'Trash is full', 'alerts': False}],
+        }, format='json')
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual([(o['label'], o['alerts']) for o in res.data['options']],
+                         [('Out of soap', True), ('Trash is full', False)])
+
+    def test_issues_question_needs_options_and_unique_labels(self):
+        empty = api(self.user).post(self.url, {'question': 'Q', 'question_type': 'issues', 'options': []}, format='json')
+        dupes = api(self.user).post(self.url, {
+            'question': 'Q', 'question_type': 'issues', 'options': [{'label': 'Soap'}, {'label': 'soap'}],
+        }, format='json')
+        self.assertEqual((empty.status_code, dupes.status_code), (400, 400))
+
+    def test_update_options_keeps_ids_adds_and_removes_but_history_survives(self):
+        q = Question.objects.create(organization=self.org, survey=self.survey, question='Q', question_type='issues')
+        soap  = IssueOption.objects.create(question=q, label='Out of soap', position=0)
+        trash = IssueOption.objects.create(question=q, label='Trash is full', position=1)
+        resp  = SurveyResponse.objects.create(survey=self.survey, question=q)
+        ResponseIssue.objects.create(survey_response=resp, option=trash, label=trash.label)
+
+        res = api(self.user).patch(f'{self.url}{q.id}/', {'options': [
+            {'id': str(soap.id), 'label': 'No soap'},
+            {'label': 'Wet floor'},
+        ]}, format='json')
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual([o['label'] for o in res.data['options']], ['No soap', 'Wet floor'])
+        self.assertEqual(res.data['options'][0]['id'], str(soap.id))
+        self.assertEqual(ResponseIssue.objects.get().label, 'Trash is full')   # snapshot kept
+
+    def test_switch_question_off(self):
+        q = Question.objects.create(organization=self.org, survey=self.survey, question='Q')
+        res = api(self.user).patch(f'{self.url}{q.id}/', {'active': False}, format='json')
+        self.assertEqual((res.status_code, res.data['active']), (200, False))
+
+    def test_new_survey_with_nested_issues_question(self):
+        res = api(self.user).post('/api/dashboard/surveys/', {
+            'name': 'Restroom', 'questions': [
+                {'question': 'How clean?', 'scale_type': 'stars'},
+                {'question': 'Issues?', 'question_type': 'issues', 'options': [{'label': 'Out of soap'}]},
+            ],
+        }, format='json')
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual([q['question_type'] for q in res.data['questions']], ['rating', 'issues'])
+        self.assertEqual(res.data['questions'][1]['options'][0]['label'], 'Out of soap')
+
+
+@mock.patch('survey.tasks.send_alert.delay')
+@mock.patch('survey.tasks.send_issue_alerts.delay')
+class IssueInsightsTests(IssueQuestionFixture, TestCase):
+
+    def test_rating_metrics_ignore_issue_answers_and_issues_block_reports(self, issue_mail, rating_mail):
+        self.submit([self.soap.id, self.trash.id], rating=4)
+        self.submit([self.soap.id], rating=2)
+        self.submit([], rating=5)
+
+        data = api(self.user).get('/api/dashboard/insights/').data
+        self.assertEqual(data['summary']['total_responses'], 3)          # rated answers only
+        self.assertEqual(data['summary']['avg_rating'], round(11 / 3, 2))
+        self.assertNotIn('None', data['distribution'])
+        self.assertEqual(data['issues']['answered'], 3)
+        self.assertEqual(data['issues']['with_issues'], 2)
+        self.assertEqual(data['issues']['top'][0], {'label': 'Out of soap', 'count': 2})
+
+        soap = next(a for a in data['pending_alerts'] if a['kind'] == 'issue' and a['issue_label'] == 'Out of soap')
+        self.assertEqual(soap['report_count'], 2)
+
+
+class IssueAlertEmailTests(IssueQuestionFixture, TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.org.alert_email = 'ops@example.com'
+        self.org.save()
+        env = {k: v for k, v in os.environ.items()}
+        env.update({'RESEND_API_KEY': 're_test', 'ALERTS_FROM_EMAIL': 'alerts@taprate.app'})
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _alerts(self, comment=''):
+        resp = SurveyResponse.objects.create(location=self.location, survey=self.survey,
+                                             question=self.issues_q, comment=comment)
+        return [
+            Alert.objects.create(survey_response=resp, location=self.location, kind='issue',
+                                 issue_option=o, issue_label=o.label)
+            for o in (self.soap, self.trash)
+        ]
+
+    def test_one_email_lists_issues_escapes_comment_and_marks_notified(self):
+        alerts = self._alerts(comment='<a href="http://evil">click</a>')
+        with mock.patch('resend.Emails.send', return_value={'id': 'em_1'}) as send:
+            tasks.send_issue_alerts([str(a.id) for a in alerts])
+        send.assert_called_once()
+        msg = send.call_args.args[0]
+        self.assertEqual(msg['to'], ['ops@example.com'])
+        self.assertIn('Out of soap, Trash is full', msg['subject'])
+        self.assertNotIn('<a href="http://evil">', msg['html'])
+        self.assertEqual(set(Alert.objects.values_list('status', flat=True)), {'owner_notified'})
+
+    def test_alerts_disabled_sends_nothing(self):
+        self.org.alerts_enabled = False
+        self.org.save()
+        alerts = self._alerts()
+        with mock.patch('resend.Emails.send') as send:
+            tasks.send_issue_alerts([str(a.id) for a in alerts])
+        send.assert_not_called()

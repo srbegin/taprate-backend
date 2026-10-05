@@ -21,8 +21,8 @@ from django.utils import timezone
 
 from survey.models import (
     Organization, User,
-    Survey, Question,
-    Location, SurveyResponse, Alert,
+    Survey, Question, IssueOption,
+    Location, SurveyResponse, ResponseIssue, Alert,
 )
 
 DEMO_ORG_SLUG = 'demo-coffee-co'
@@ -71,6 +71,23 @@ ANALYTICS_SURVEY_DEFS = [
     },
 ]
 
+# Restroom survey (rating + issues) — assigned to the Restrooms location.
+RESTROOM_SURVEY_DEF = {
+    'name': 'Restroom Check',
+    'comments_enabled': False,
+    'comments_prompt': '',
+    'alert_threshold': 2,
+    'questions': [
+        {'question': 'How clean is this restroom?', 'scale_type': 'stars', 'position': 0},
+        {'question': 'Anything need attention?', 'question_type': 'issues', 'position': 1,
+         'options': ['Out of toilet paper', 'Out of soap', 'Out of paper towels',
+                     'Needs cleaning', 'Trash is full']},
+    ],
+}
+
+# Open issue alerts are generated for reports in the last few days only.
+ISSUE_ALERT_DAYS = 3
+
 # Rating personality per location: (mean, std_dev)
 LOCATION_BIAS = {
     'Main Counter':  (4.2, 0.8),
@@ -113,15 +130,19 @@ def _make_survey(org, defn):
         },
     )
     for q in defn['questions']:
-        Question.objects.get_or_create(
+        question, created = Question.objects.get_or_create(
             survey=survey,
             question=q['question'],
             defaults={
-                'organization': org,
-                'scale_type':   q['scale_type'],
-                'position':     q['position'],
+                'organization':  org,
+                'question_type': q.get('question_type', 'rating'),
+                'scale_type':    q.get('scale_type', 'numbers'),
+                'position':      q['position'],
             },
         )
+        if created:
+            for i, label in enumerate(q.get('options', [])):
+                IssueOption.objects.create(question=question, label=label, position=i)
     return survey
 
 
@@ -192,12 +213,18 @@ class Command(BaseCommand):
             )
             locations.append(loc)
 
+        restroom_survey = _make_survey(org, RESTROOM_SURVEY_DEF)
+        Location.objects.filter(organization=org, name='Restrooms').update(survey=restroom_survey)
+        for loc in locations:
+            loc.refresh_from_db(fields=['survey'])
+
         self.stdout.write(f'Locations ready: {len(locations)}')
 
         # ── Response data ─────────────────────────────────────────────────────
         now = timezone.now()
         session_count  = 0
         response_count = 0
+        open_issue_alerts = {}   # (location_id, option_id) -> [first response, count, first at, last at]
 
         for days_ago in range(DAYS, 0, -1):
             base_day = (now - timedelta(days=days_ago)).replace(
@@ -205,7 +232,7 @@ class Command(BaseCommand):
             )
             for _ in range(random.randint(*RESPONSES_PER_DAY)):
                 loc     = random.choice(locations)
-                survey  = random.choice(analytics_surveys)
+                survey  = loc.survey if loc.survey_id == restroom_survey.id else random.choice(analytics_surveys)
                 qs      = list(survey.questions.order_by('position'))
                 if not qs:
                     continue
@@ -217,9 +244,31 @@ class Command(BaseCommand):
                     minutes=random.randint(0, 59),
                 )
 
+                last_rating = None
                 for i, question in enumerate(qs):
-                    rating   = clamp(random.gauss(mean, std) + random.gauss(0, 0.3), 1, 5)
                     is_first = (i == 0)
+
+                    if question.question_type == 'issues':
+                        # Lower ratings → more likely to report issues
+                        options = list(question.options.all())
+                        chance  = {1: 0.9, 2: 0.7, 3: 0.35}.get(last_rating, 0.08)
+                        picked  = random.sample(options, k=random.randint(1, 2)) if random.random() < chance else []
+                        resp = SurveyResponse.objects.create(
+                            session_id = session_id, location = loc, survey = survey,
+                            question   = question, rating = None, email = '',
+                        )
+                        SurveyResponse.objects.filter(pk=resp.pk).update(created_at=created_at)
+                        for option in picked:
+                            ResponseIssue.objects.create(survey_response=resp, option=option, label=option.label)
+                            if days_ago <= ISSUE_ALERT_DAYS and option.alerts:
+                                entry = open_issue_alerts.setdefault((loc.id, option.id), [resp, 0, created_at, created_at])
+                                entry[1] += 1
+                                entry[3] = max(entry[3], created_at)
+                        response_count += 1
+                        continue
+
+                    rating   = clamp(random.gauss(mean, std) + random.gauss(0, 0.3), 1, 5)
+                    last_rating = rating
 
                     resp = SurveyResponse.objects.create(
                         session_id = session_id,
@@ -245,6 +294,16 @@ class Command(BaseCommand):
 
                     response_count += 1
                 session_count += 1
+
+        # One open alert per location + issue, counting the recent reports
+        for (location_id, option_id), (first_resp, count, first_at, last_at) in open_issue_alerts.items():
+            option = IssueOption.objects.get(pk=option_id)
+            alert = Alert.objects.create(
+                survey_response=first_resp, location_id=location_id, kind='issue',
+                issue_option=option, issue_label=option.label,
+                report_count=count, last_reported_at=last_at,
+            )
+            Alert.objects.filter(pk=alert.pk).update(created_at=first_at)
 
         self.stdout.write(self.style.SUCCESS(
             f'Done — {session_count} sessions, {response_count} responses '

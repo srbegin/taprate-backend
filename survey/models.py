@@ -206,6 +206,10 @@ class Question(models.Model):
     A single question within a Survey.
     Formerly Survey.
     """
+    TYPE_CHOICES = [
+        ('rating', 'Rating (1–5)'),
+        ('issues', 'Issues (pick any that apply)'),
+    ]
     SCALE_CHOICES = [
         ('numbers', 'Numbers (1–5)'),
         ('stars', 'Stars (1–5)'),
@@ -225,7 +229,11 @@ class Question(models.Model):
     )
     position = models.IntegerField(default=0)
     question = models.CharField(max_length=500, default='How was your experience?')
+    question_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='rating')
+    # Rating questions only.
     scale_type = models.CharField(max_length=20, choices=SCALE_CHOICES, default='numbers')
+    # Inactive questions are kept (with their options) but hidden from the
+    # survey and rejected on submit — e.g. a business switching its issues step off.
     active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -235,6 +243,31 @@ class Question(models.Model):
     def __str__(self):
         org = self.organization.name if self.organization else 'No Org'
         return f"{org} — {self.question[:60]}"
+
+
+class IssueOption(models.Model):
+    """
+    One pickable issue on an 'issues' question (e.g. "Out of soap").
+    Businesses add these from presets or type their own.
+    """
+    id       = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    question = models.ForeignKey(
+                   # CASCADE: options are part of the question. Reports keep a
+                   # label snapshot (ResponseIssue / Alert), so history survives.
+                   Question, on_delete=models.CASCADE, related_name='options'
+               )
+    label    = models.CharField(max_length=80)
+    position = models.IntegerField(default=0)
+    alerts   = models.BooleanField(
+                   default=True,
+                   help_text='Email the business when a customer reports this issue.',
+               )
+
+    class Meta:
+        ordering = ['position']
+
+    def __str__(self):
+        return self.label
 
 
 class Incentive(models.Model):
@@ -355,7 +388,8 @@ class SurveyResponse(models.Model):
                            Question, null=True, blank=True,
                            on_delete=models.SET_NULL, related_name='responses'
                        )
-    rating           = models.IntegerField(choices=[(i, str(i)) for i in range(1, 6)])
+    # Null for answers to 'issues' questions — see ResponseIssue.
+    rating           = models.IntegerField(choices=[(i, str(i)) for i in range(1, 6)], null=True, blank=True)
     comment          = models.TextField(blank=True)
     email            = models.EmailField(blank=True)
     marketing_opt_in = models.BooleanField(default=False)
@@ -382,7 +416,25 @@ class SurveyResponse(models.Model):
 
     def __str__(self):
         marker = ' [TEST]' if self.is_test else ''
-        return f"Response {self.id} — {self.rating}★{marker}"
+        answer = f"{self.rating}★" if self.rating is not None else 'issues'
+        return f"Response {self.id} — {answer}{marker}"
+
+
+class ResponseIssue(models.Model):
+    """One issue a customer selected in an answer to an 'issues' question."""
+    id              = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    survey_response = models.ForeignKey(
+                          SurveyResponse, on_delete=models.CASCADE, related_name='issues'
+                      )
+    option          = models.ForeignKey(
+                          # SET_NULL + label snapshot: reports outlive renamed/deleted options.
+                          IssueOption, null=True, blank=True,
+                          on_delete=models.SET_NULL, related_name='reports'
+                      )
+    label           = models.CharField(max_length=80)
+
+    def __str__(self):
+        return self.label
 
 
 class Alert(models.Model):
@@ -392,6 +444,11 @@ class Alert(models.Model):
         ('sent',           'Sent'),
         ('resolved',       'Resolved'),
     ]
+    KIND_CHOICES = [
+        ('low_rating', 'Low rating'),
+        ('issue',      'Issue reported'),
+    ]
+    OPEN_STATUSES = ('pending', 'owner_notified')
 
     id              = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     survey_response = models.ForeignKey(
@@ -403,12 +460,25 @@ class Alert(models.Model):
                           # CASCADE: an alert without a location is unactionable.
                           Location, on_delete=models.CASCADE, related_name='alerts'
                       )
-    rating          = models.IntegerField()
+    kind            = models.CharField(max_length=20, choices=KIND_CHOICES, default='low_rating')
+    rating          = models.IntegerField(null=True, blank=True)   # low_rating alerts only
+    # ── Issue alerts ──────────────────────────────────────────────────────────
+    # At most one open (pending/owner_notified) alert per location + issue:
+    # repeat reports bump report_count instead of re-alerting. Resolving re-arms.
+    issue_option     = models.ForeignKey(
+                           IssueOption, null=True, blank=True,
+                           on_delete=models.SET_NULL, related_name='issue_alerts'
+                       )
+    issue_label      = models.CharField(max_length=80, blank=True)
+    report_count     = models.IntegerField(default=1)
+    last_reported_at = models.DateTimeField(null=True, blank=True)
     status          = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     created_at      = models.DateTimeField(auto_now_add=True)
     resolved_at     = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
+        if self.kind == 'issue':
+            return f"Alert {self.id} — {self.issue_label} ×{self.report_count}"
         return f"Alert {self.id} — {self.rating}★"
 
 class ContactSubmission(models.Model):

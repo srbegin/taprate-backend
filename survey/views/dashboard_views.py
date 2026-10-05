@@ -18,7 +18,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..permissions import HasActiveAccess
-from ..models import Location, Survey, Question, SurveyResponse, Alert
+from ..models import Location, Survey, Question, SurveyResponse, Alert, ResponseIssue
 from ..serializers import (
     LocationSerializer, OrganizationSerializer,
     QuestionSerializer, QuestionWriteSerializer,
@@ -132,7 +132,7 @@ class SurveyListView(APIView):
     def get(self, request):
         surveys = Survey.objects.filter(
             organization=request.user.organization, product=get_product(request),
-        ).prefetch_related('questions', 'incentives', 'locations').order_by('-created_at')
+        ).prefetch_related('questions__options', 'incentives', 'locations').order_by('-created_at')
         data = SurveySerializer(surveys, many=True).data
         return Response(list_response(data))
 
@@ -259,14 +259,18 @@ class AlertListView(APIView):
     @staticmethod
     def _serialize(alert):
         return {
-            'id':          str(alert.id),
-            'location':    alert.location.name,
-            'location_id': str(alert.location.id),
-            'rating':      alert.rating,
-            'comment':     alert.survey_response.comment,
-            'status':      alert.status,
-            'created_at':  alert.created_at.isoformat(),
-            'resolved_at': alert.resolved_at.isoformat() if alert.resolved_at else None,
+            'id':               str(alert.id),
+            'kind':             alert.kind,             # 'low_rating' | 'issue'
+            'location':         alert.location.name,
+            'location_id':      str(alert.location.id),
+            'rating':           alert.rating,           # low_rating only
+            'issue_label':      alert.issue_label,      # issue only
+            'report_count':     alert.report_count,     # issue only — repeat reports while open
+            'last_reported_at': alert.last_reported_at.isoformat() if alert.last_reported_at else None,
+            'comment':          alert.survey_response.comment,
+            'status':           alert.status,
+            'created_at':       alert.created_at.isoformat(),
+            'resolved_at':      alert.resolved_at.isoformat() if alert.resolved_at else None,
         }
 
 
@@ -320,14 +324,17 @@ class InsightsView(APIView):
         period_start = now - timedelta(days=days)
         prev_start   = period_start - timedelta(days=days)
 
-        # Base queryset — real responses only
-        base_qs = SurveyResponse.objects.filter(
+        # All real answers (rating + issues questions)
+        answers_qs = SurveyResponse.objects.filter(
             location__organization=org,
             location__product=product,
             is_test=False,
         )
         if location_id:
-            base_qs = base_qs.filter(location_id=location_id)
+            answers_qs = answers_qs.filter(location_id=location_id)
+
+        # Rating metrics use rated answers only — issue answers have no rating.
+        base_qs = answers_qs.filter(rating__isnull=False)
 
         current_qs  = base_qs.filter(created_at__gte=period_start)
         previous_qs = base_qs.filter(created_at__gte=prev_start, created_at__lt=period_start)
@@ -384,12 +391,23 @@ class InsightsView(APIView):
         for row in distribution_qs:
             distribution[str(row['rating'])] = row['count']
 
+        # Issues: answers to issues questions (rating is null), how many
+        # reported something, and the most-reported issues.
+        issue_answers = answers_qs.filter(rating__isnull=True, created_at__gte=period_start)
+        top_issues = (
+            ResponseIssue.objects
+            .filter(survey_response__in=issue_answers)
+            .values('label')
+            .annotate(count=Count('id'))
+            .order_by('-count', 'label')[:10]
+        )
+
         alert_qs = Alert.objects.filter(
             location__organization=org,
             location__product=product,
-            status__in=['pending', 'owner_notified'],
+            status__in=Alert.OPEN_STATUSES,
             survey_response__is_test=False,
-        ).select_related('location').order_by('-created_at')
+        ).select_related('location', 'survey_response').order_by('-created_at')
         if location_id:
             alert_qs = alert_qs.filter(location_id=location_id)
 
@@ -414,16 +432,12 @@ class InsightsView(APIView):
                 for r in location_breakdown
             ],
             'distribution':   distribution,
-            'pending_alerts': [
-                {
-                    'id':         str(a.id),
-                    'location':   a.location.name,
-                    'rating':     a.rating,
-                    'status':     a.status,
-                    'created_at': a.created_at.isoformat(),
-                }
-                for a in alert_qs[:10]
-            ],
+            'issues': {
+                'answered':    issue_answers.count(),
+                'with_issues': issue_answers.filter(issues__isnull=False).distinct().count(),
+                'top':         [{'label': r['label'], 'count': r['count']} for r in top_issues],
+            },
+            'pending_alerts': [AlertListView._serialize(a) for a in alert_qs[:10]],
         })
 
 

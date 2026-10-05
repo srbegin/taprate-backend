@@ -8,8 +8,10 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from django.shortcuts import get_object_or_404
 from django.core.cache import cache
+from django.db.models import F
+from django.utils import timezone
 
-from ..models import Location, Question, SurveyResponse, Alert, IncentiveWin
+from ..models import Location, Question, SurveyResponse, Alert, IncentiveWin, ResponseIssue
 from ..serializers import SurveyPublicSerializer, SurveyResponseSubmitSerializer
 
 # Session token TTL in seconds (30 minutes)
@@ -51,6 +53,38 @@ def _resolve_session(session_token):
         return None, None
 
 
+def _record_issue_alerts(location, survey_response, options):
+    """
+    Raise issue alerts for the selected alerting options. At most one open
+    alert exists per location + issue: a repeat report bumps its count instead
+    of alerting again. Returns the newly created alerts (to email).
+    """
+    now = timezone.now()
+    created = []
+    for option in options:
+        open_alert = (
+            Alert.objects
+            .filter(location=location, kind='issue', issue_option=option,
+                    status__in=Alert.OPEN_STATUSES)
+            .order_by('created_at')
+            .first()
+        )
+        if open_alert:
+            Alert.objects.filter(pk=open_alert.pk).update(
+                report_count=F('report_count') + 1, last_reported_at=now,
+            )
+        else:
+            created.append(Alert.objects.create(
+                survey_response=survey_response,
+                location=location,
+                kind='issue',
+                issue_option=option,
+                issue_label=option.label,
+                last_reported_at=now,
+            ))
+    return created
+
+
 class PublicSurveyDetailView(APIView):
     """GET /api/survey/<session_token>/ — load survey for NFC tap."""
     permission_classes = [AllowAny]
@@ -87,7 +121,10 @@ class SurveyResponseView(APIView):
 
     Accepts a full Survey submission:
     {
-        "responses": [{"question_id": "<uuid>", "rating": 4}, ...],
+        "responses": [
+            {"question_id": "<uuid>", "rating": 4},             # rating question
+            {"question_id": "<uuid>", "issue_ids": ["<uuid>"]}  # issues question ([] = all good)
+        ],
         "comment": "optional",
         "email": "optional",
         "marketing_opt_in": false,
@@ -125,6 +162,37 @@ class SurveyResponseView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+        # ── Validate each answer against its (active) question ─────────────
+        # Done before consuming the token so a bad payload doesn't burn it.
+        valid_questions = {
+            str(q.id): q
+            for q in survey.questions.filter(active=True).prefetch_related('options')
+        }
+        answers = []   # (question, rating | None, [IssueOption, ...])
+        for resp_data in serializer.validated_data['responses']:
+            question = valid_questions.get(str(resp_data['question_id']))
+            if question is None:
+                return Response(
+                    {'detail': f"Question {resp_data['question_id']} does not belong to this survey."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if question.question_type == 'issues':
+                options_by_id = {str(o.id): o for o in question.options.all()}
+                picked = {str(i) for i in resp_data.get('issue_ids') or []}
+                if not picked <= options_by_id.keys():
+                    return Response(
+                        {'detail': f"Unknown issue for question {question.id}."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                answers.append((question, None, [o for o in question.options.all() if str(o.id) in picked]))
+            else:
+                if resp_data.get('rating') is None:
+                    return Response(
+                        {'detail': f"A rating is required for question {question.id}."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                answers.append((question, resp_data['rating'], []))
+
         # ── Consume the token before any writes ────────────────────────────
         cache.delete(f'survey_session:{session_token}')
 
@@ -148,23 +216,10 @@ class SurveyResponseView(APIView):
         recovery_triggered = (
             survey.recovery_enabled
             and any(
-                r['rating'] <= survey.recovery_threshold
-                for r in validated['responses']
+                rating is not None and rating <= survey.recovery_threshold
+                for _, rating, _ in answers
             )
         )
-
-        # Build a lookup of valid question IDs in this survey
-        valid_questions = {
-            str(q.id): q
-            for q in survey.questions.all()
-        }
-
-        for resp_data in validated['responses']:
-            if str(resp_data['question_id']) not in valid_questions:
-                return Response(
-                    {'detail': f"Question {resp_data['question_id']} does not belong to this survey."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
 
         # ── Incentive draw — skipped for test responses ────────────────────
         incentive_won     = False
@@ -185,10 +240,9 @@ class SurveyResponseView(APIView):
         # ── Create responses ───────────────────────────────────────────────
         session_id        = uuid.uuid4()
         created_responses = []
+        new_issue_alerts  = []
 
-        for resp_data in validated['responses']:
-            question = valid_questions[str(resp_data['question_id'])]
-            rating   = resp_data['rating']
+        for question, rating, picked_options in answers:
             is_first = not created_responses
 
             response_obj = SurveyResponse.objects.create(
@@ -210,8 +264,19 @@ class SurveyResponseView(APIView):
             )
             created_responses.append(response_obj)
 
-            # ── Alerts — skipped for test responses ───────────────────────
-            if not is_test and rating <= survey.alert_threshold:
+            # ── Issues + issue alerts (deduped per location + issue) ──────
+            if question.question_type == 'issues':
+                ResponseIssue.objects.bulk_create([
+                    ResponseIssue(survey_response=response_obj, option=o, label=o.label)
+                    for o in picked_options
+                ])
+                if not is_test:
+                    new_issue_alerts += _record_issue_alerts(
+                        location, response_obj, [o for o in picked_options if o.alerts],
+                    )
+
+            # ── Low-rating alerts — skipped for test responses ────────────
+            elif not is_test and rating <= survey.alert_threshold:
                 alert = Alert.objects.create(
                     survey_response=response_obj,
                     location=location,
@@ -219,6 +284,10 @@ class SurveyResponseView(APIView):
                 )
                 from ..tasks import send_alert
                 send_alert.delay(str(alert.id))
+
+        if new_issue_alerts:
+            from ..tasks import send_issue_alerts
+            send_issue_alerts.delay([str(a.id) for a in new_issue_alerts])
 
         # ── IncentiveWin record — skipped for test responses ──────────────
         if not is_test and incentive_won and winning_incentive and created_responses:
